@@ -118,7 +118,8 @@ input[type=number]{width:70px}
 #links .casing{stroke:var(--bg);stroke-width:6;opacity:.9}
 #links .hit{stroke:transparent;stroke-width:14;pointer-events:stroke;cursor:pointer}
 #links .lnk.hover .wire{stroke-width:4.5;opacity:1;filter:drop-shadow(0 0 3px currentColor)}
-#links .lnk.sel .wire{stroke-width:4.5;opacity:1;stroke-dasharray:8 4}
+#links .lnk.sel .wire{stroke-width:4.5;opacity:1}
+#links .lnk.sel .casing{stroke:#fff;stroke-width:8;opacity:.35}
 #links path.temp{stroke-width:2.5;fill:none;stroke-dasharray:6 4;pointer-events:none}
 #linkLabels{position:absolute;left:0;top:0;z-index:1}
 #nodes{position:relative;z-index:2}
@@ -130,3 +131,24 @@ input[type=number]{width:70px}
 .port .rate{flex:none}
 .port .add{margin:0 0 0 6px}
 .pcol.out .port .add{margin:0 6px 0 0}
+
+#links .lnk.p2 .wire{stroke-dasharray:9 5}
+#links .lnk.p3 .wire{stroke-dasharray:2 5}
+.lnk-label .prio{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;border-radius:50%;font-size:9px;font-weight:800;cursor:pointer;background:#e8a33d;color:#111;flex:none}
+.lnk-label .prio.p2{background:#8a91a0}
+.lnk-label .prio.p3{background:#4d5360;color:#ddd}
+.lnk-label .prio:hover{outline:2px solid #fff}
+.lnk-label.p2,.lnk-label.p3{border-style:dashed}
+.mode{display:inline-block;margin-left:6px;font-size:9.5px;font-weight:700;letter-spacing:.04em;padding:0 5px;border-radius:3px;vertical-align:2px;background:#2d3340;color:var(--dim)}
+.mode.target{background:#7a5418;color:#ffd79a}
+.mode.supply,.mode.supply-auto{background:#1f4a35;color:#9be3bd}
+.mode.demand{background:#24324a;color:#9cc3ff}
+.port .bal{font-size:10.5px;font-weight:700;padding:0 3px;border-radius:3px;font-variant-numeric:tabular-nums;flex:none}
+.port .bal.short{color:#fff;background:#8e2b2b}
+.port .bal.over{color:#fff;background:#5b3a8e}
+.ctxmenu{position:fixed;z-index:70;background:var(--panel);border:1px solid var(--line);border-radius:6px;box-shadow:0 6px 18px #000a;padding:4px 0;min-width:230px}
+.ctxitem{padding:5px 12px;cursor:pointer;white-space:nowrap}
+.ctxitem:hover{background:var(--panel2)}
+.ctxitem.cur{color:var(--acc)}
+.ctxitem.danger{color:var(--bad);border-top:1px solid var(--line)}
+.modesel{max-width:110px}

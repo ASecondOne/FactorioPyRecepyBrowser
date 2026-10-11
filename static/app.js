@@ -291,7 +291,7 @@ function renderNode(n) {
     icon(m.icon),
     el('div', { class: 'title' },
       el('div', { class: 'mname', 'data-tip': 'Click to switch machine (tier)', onclick: (e) => { e.stopPropagation(); openMachineSwitch(n); } }, m.n),
-      el('div', { class: 'count' }, cnt === null ? '' : '× ' + fmt(cnt), cnt ? el('small', {}, `  (${Math.ceil(cnt - 1e-6)} buildings)`) : '')),
+      el('div', { class: 'count' }, cnt === null ? '' : '× ' + fmt(cnt), cnt ? el('small', {}, `  (${Math.ceil(cnt - 1e-6)} buildings)`) : '', modeBadge(n, res))),
     el('button', { class: 'x', 'data-tip': 'Delete node', onclick: (e) => { e.stopPropagation(); deleteNode(n); } }, '✕'));
   head.addEventListener('mousedown', (e) => startNodeDrag(e, n));
   box.append(head);
@@ -322,18 +322,18 @@ function renderNode(n) {
   if (res?.warning) box.append(el('div', { class: 'errmsg warn' }, res.warning));
   // footer: target + modules
   const f = el('div', { class: 'node-f' });
-  const tsel = el('select', { 'data-tip': 'Target for this node' },
-    el('option', { value: '' }, 'no target'), el('option', { value: 'machines' }, '# machines'), el('option', { value: 'rate' }, 'rate'), el('option', { value: 'consume' }, 'use all linked input'));
-  tsel.value = n.target ? n.target.kind : '';
+  const tsel = el('select', { class: 'modesel', 'data-tip': 'Mode:\n◀ demand – sized by what linked consumers pull (default)\n▶ supply – runs on whatever reaches its linked inputs\n# machines / rate – fixed target that drives the rest' },
+    el('option', { value: '' }, '◀ demand'), el('option', { value: 'supply' }, '▶ supply'), el('option', { value: 'machines' }, '# machines'), el('option', { value: 'rate' }, 'rate'));
+  tsel.value = !n.target ? '' : (n.target.kind === 'consume' ? 'supply' : n.target.kind);
   tsel.onchange = () => {
     if (!tsel.value) n.target = null;
-    else if (tsel.value === 'consume') n.target = { kind: 'consume', item: null, value: 0 };
+    else if (tsel.value === 'supply') n.target = { kind: 'supply', item: null, value: 0 };
     else if (tsel.value === 'machines') n.target = { kind: 'machines', item: null, value: res?.machines ? +res.machines.toFixed(3) || 1 : 1 };
     else { const it = r?.m || r?.o[0]?.n; const p = res?.outputs?.find((o) => o.item === it); n.target = { kind: 'rate', item: it, value: p?.rate ? +p.rate.toPrecision(4) : 1 }; }
     changed();
   };
   f.append(tsel);
-  if (n.target && n.target.kind !== 'consume') {
+  if (n.target && n.target.kind !== 'consume' && n.target.kind !== 'supply') {
     const scale = n.target.kind === 'rate' ? unit() : 1;
     const inp = el('input', { type: 'number', min: '0', step: 'any', value: +(n.target.value * scale).toPrecision(6) });
     inp.onchange = () => { const v = parseFloat(inp.value); if (!isNaN(v) && v >= 0) { n.target.value = v / scale; changed(); } };
@@ -362,13 +362,23 @@ function renderNode(n) {
   }
   return box;
 }
+function modeBadge(n, res) {
+  const mode = res?.mode || (n.target ? (n.target.kind === 'consume' || n.target.kind === 'supply' ? 'supply' : 'target') : 'demand');
+  const info = {
+    target: ['TARGET', 'Fixed target – drives everything linked to it'],
+    demand: ['◀ DEMAND', 'Sized by what its linked consumers pull (primary links)'],
+    supply: ['▶ SUPPLY', 'Runs on whatever reaches its linked inputs; output lands on top of demand'],
+    'supply-auto': ['▶ SUPPLY (auto)', 'Only feeds secondary links, so nothing pulls it: it runs on what its inputs provide and adds on top'],
+  }[mode] || [mode.toUpperCase(), ''];
+  return el('span', { class: 'mode ' + mode, 'data-tip': info[1] }, info[0]);
+}
 function fmtJ(j) { return j >= 1e6 ? +(j / 1e6).toFixed(2) + ' MJ' : +(j / 1e3).toFixed(1) + ' kJ'; }
 function renderPort(n, item, dir, res, meta = {}) {
   const pr = res && (dir === 'in' ? res.inputs : res.outputs).find((p) => p.item === item);
   const linked = S.links.some((l) => (dir === 'in' ? l.to.node === n.id && l.to.item === item : l.from.node === n.id && l.from.item === item));
   const isTarget = n.target?.kind === 'rate' && n.target.item === item && dir === 'out';
   const t = itemType(item);
-  const p = el('div', { class: 'port' + (isTarget ? ' target' : ''), 'data-tip': `${itemName(item)}${pr ? `\nper machine: ${fmt(pr.per_machine * unit())}${unitLabel()}` : ''}${pr?.slack ? (dir === 'in' ? `\nDEFICIT ${fmt(pr.slack * unit())}${unitLabel()} (supplier too small)` : `\nsurplus ${fmt(pr.slack * unit())}${unitLabel()} not consumed`) : ''}` });
+  const p = el('div', { class: 'port' + (isTarget ? ' target' : ''), 'data-tip': `${itemName(item)}${pr ? `\nper machine: ${fmt(pr.per_machine * unit())}${unitLabel()}` : ''}${pr?.slack ? (dir === 'in' ? `\nSHORT ${fmt(pr.slack * unit())}${unitLabel()} (linked suppliers too small)` : `\nexcess ${fmt(pr.slack * unit())}${unitLabel()} not consumed`) : ''}${pr?.excess ? `\nOVER-SUPPLIED by ${fmt(pr.excess * unit())}${unitLabel()} (secondary links on top of demand)` : ''}` });
   const h = el('span', { class: `handle ${t}${linked ? ' linked' : ''}${meta.fuel ? ' fuelport' : ''}`, 'data-node': n.id, 'data-item': item, 'data-dir': dir, 'data-fuel': meta.fuel ? '1' : null });
   h.addEventListener('mousedown', (e) => startLinkDrag(e, n, item, dir));
   let rcls = 'rate';
@@ -376,6 +386,8 @@ function renderPort(n, item, dir, res, meta = {}) {
   else if (!linked) rcls += ' free';
   const rate = el('span', { class: rcls }, pr ? fmt(pr.rate * unit()) + unitLabel() : '');
   p.append(h, itemIcon(item), rate);
+  if (pr?.slack > 1e-7) p.append(el('span', { class: 'bal ' + (dir === 'in' ? 'short' : 'over') }, (dir === 'in' ? '−' : '+') + fmt(pr.slack * unit())));
+  if (pr?.excess > 1e-7) p.append(el('span', { class: 'bal over' }, '+' + fmt(pr.excess * unit())));
   if (meta.fuel) p.append(el('span', { class: 'tag', 'data-tip': 'fuel' }, '🔥'));
   if (meta.burnt) p.append(el('span', { class: 'tag', 'data-tip': 'burnt result of fuel' }, 'burnt'));
   if (!linked && !n.kind) {
@@ -455,7 +467,8 @@ function renderLinks() {
     const d = routeLink(a, b, rectOf[l.from.node], rectOf[l.to.node], back ? (backLane++ % 5) : 0);
     const col = itemColor(l.from.item);
     const g = document.createElementNS(NS, 'g');
-    g.setAttribute('class', 'lnk' + (selLink === l ? ' sel' : '') + (itemType(l.from.item) === 'fluid' ? ' fluid' : ''));
+    const pr = l.priority || 1;
+    g.setAttribute('class', 'lnk p' + pr + (selLink === l ? ' sel' : '') + (itemType(l.from.item) === 'fluid' ? ' fluid' : ''));
     g.dataset.id = l.id;
     const hit = document.createElementNS(NS, 'path'); hit.setAttribute('d', d); hit.setAttribute('class', 'hit');
     const casing = document.createElementNS(NS, 'path'); casing.setAttribute('d', d); casing.setAttribute('class', 'casing');
@@ -464,11 +477,14 @@ function renderLinks() {
     const sel = (e) => { e.stopPropagation(); selLink = l; selNode = null; document.querySelectorAll('.node.sel').forEach((x) => x.classList.remove('sel')); renderLinks(); };
     const del = (e) => { e.stopPropagation(); S.links = S.links.filter((x) => x !== l); selLink = null; changed(); };
     hit.addEventListener('mousedown', sel); hit.addEventListener('dblclick', del);
+    hit.addEventListener('contextmenu', (e) => { e.preventDefault(); openLinkMenu(l, e.clientX, e.clientY); });
     svg.append(g);
     const rate = R?.links?.[l.id];
     let lab = null;
     if (rate !== undefined && showLabels) {
-      lab = el('div', { class: 'lnk-label' + (selLink === l ? ' sel' : ''), 'data-tip': `${itemName(l.from.item)}: ${fmt(rate * unit())}${unitLabel()}` }, itemIcon(l.from.item), fmt(rate * unit()) + unitLabel());
+      const mk = el('span', { class: 'prio p' + pr, 'data-tip': `${PRIO[pr][1]}\nclick to cycle P → S → T · right-click for menu`, onmousedown: (e) => e.stopPropagation(), onclick: (e) => { e.stopPropagation(); setPriority(l, pr % 3 + 1); } }, PRIO[pr][0]);
+      lab = el('div', { class: 'lnk-label p' + pr + (selLink === l ? ' sel' : ''), 'data-link': l.id, 'data-tip': `${itemName(l.from.item)}: ${fmt(rate * unit())}${unitLabel()} (${PRIO[pr][1].split(' –')[0]})` }, mk, itemIcon(l.from.item), fmt(rate * unit()) + unitLabel());
+      lab.addEventListener('contextmenu', (e) => { e.preventDefault(); openLinkMenu(l, e.clientX, e.clientY); });
       lab.style.borderColor = col;
       lab.addEventListener('mousedown', sel); lab.addEventListener('dblclick', del);
       labels.append(lab);
@@ -570,9 +586,23 @@ function openFuelPicker(n) {
   search.oninput = render; render();
   openModal(`Fuel for ${m.n} (${opts.length})`, wrap);
 }
+const PRIO = { 1: ['P', 'primary – carries demand'], 2: ['S', 'secondary – adds on top of demand'], 3: ['T', 'tertiary – adds on top, after secondary'] };
+function defaultPriority(to) { return S.links.some((l) => l.to.node === to.node && l.to.item === to.item) ? 2 : 1; }
+function setPriority(l, p) { l.priority = p; changed(); }
+function openLinkMenu(l, x, y) {
+  closeLinkMenu();
+  const menu = el('div', { id: 'linkMenu', class: 'ctxmenu' });
+  for (const p of [1, 2, 3]) menu.append(el('div', { class: 'ctxitem' + ((l.priority || 1) === p ? ' cur' : ''), onclick: () => { closeLinkMenu(); setPriority(l, p); } }, el('b', {}, PRIO[p][0]), ' ' + PRIO[p][1]));
+  menu.append(el('div', { class: 'ctxitem danger', onclick: () => { closeLinkMenu(); S.links = S.links.filter((x) => x !== l); selLink = null; changed(); } }, '✕ delete link'));
+  menu.style.left = x + 'px'; menu.style.top = y + 'px';
+  document.body.append(menu);
+  setTimeout(() => document.addEventListener('mousedown', closeLinkMenuOutside), 0);
+}
+function closeLinkMenuOutside(e) { if (!e.target.closest('#linkMenu')) closeLinkMenu(); }
+function closeLinkMenu() { document.getElementById('linkMenu')?.remove(); document.removeEventListener('mousedown', closeLinkMenuOutside); }
 function addLink(from, to) {
   if (S.links.some((l) => l.from.node === from.node && l.to.node === to.node && l.from.item === from.item)) return;
-  S.links.push({ id: 'l' + genId(), from, to });
+  S.links.push({ id: 'l' + genId(), from, to, priority: defaultPriority(to) });
   changed();
 }
 
@@ -763,7 +793,7 @@ function freeY(x, y, w = 300, h = 160) {
   }
   return y;
 }
-function addLinkSilent(from, to) { S.links.push({ id: 'l' + genId(), from, to }); }
+function addLinkSilent(from, to) { S.links.push({ id: 'l' + genId(), from, to, priority: defaultPriority(to) }); }
 function openModules(n) {
   const m = D.machines[n.machine];
   const mods = allowedModules(n.machine);
@@ -813,7 +843,8 @@ function renderSummary() {
   sec('Outputs & byproducts', R.outputs);
   sec('Drawn from infinite sources', R.sources);
   sec('Dumped into infinite sinks', R.sinks);
-  sec('Deficits on linked inputs', R.deficits, true);
+  sec('Short on linked inputs', R.deficits, true);
+  sec('Over-production (secondary on top of demand)', R.excess);
   s.append(el('div', {}, el('h4', {}, 'Totals'), el('div', {}, `${fmt(R.total_machines)} machines · ${fmtW(R.total_power_w)} electric${R.fuel_power_w ? ' · ' + fmtW(R.fuel_power_w) + ' from fuel' : ''}`)));
 }
 
@@ -842,7 +873,7 @@ function changed() {
 function serial() { return { version: 1, nodes: S.nodes, links: S.links, view: S.view, unit: unit() }; }
 function loadState(j, name = '') {
   S.nodes = (j.nodes || []).filter((n) => D.machines[n.machine] || true);
-  S.links = j.links || []; S.view = j.view || S.view; S.name = name;
+  S.links = (j.links || []).map((l) => ({ ...l, priority: l.priority || 1 })); S.view = j.view || S.view; S.name = name;
   for (const n of S.nodes) { n.modules ||= []; n.extra_speed ||= 0; n.extra_prod ||= 0; if (!n.kind && n.fuel === undefined) n.fuel = defaultFuel(n.machine); }
   if (j.unit) $('#unit').value = String(j.unit);
   $('#layoutName').textContent = name ? '— ' + name : '';

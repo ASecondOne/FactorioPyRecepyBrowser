@@ -129,10 +129,13 @@ pub struct PortRef {
 #[derive(Deserialize, Clone)]
 pub struct LinkReq {
     pub id: String,
+    /// 1 = primary (default), 2 = secondary, 3 = tertiary
+    #[serde(default)]
+    pub priority: Option<u8>,
     pub from: PortRef,
     pub to: PortRef,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct SolveReq {
     pub nodes: Vec<NodeReq>,
     pub links: Vec<LinkReq>,
@@ -146,6 +149,7 @@ pub struct PortOut {
     pub per_machine: f64,
     pub linked: bool,
     pub slack: f64, // surplus for outputs, deficit for inputs
+    pub excess: f64, // inputs only: delivered beyond what the node consumes (secondary links on top of demand)
 }
 #[derive(Serialize, Default)]
 pub struct NodeOut {
@@ -163,6 +167,7 @@ pub struct NodeOut {
     pub fuel: Option<String>,
     pub fuel_per_machine: f64,
     pub burnt: Option<String>,
+    pub mode: String, // target | demand | supply | supply-auto | source | sink
 }
 #[derive(Serialize)]
 pub struct LinkOut {
@@ -183,6 +188,7 @@ pub struct SolveResp {
     pub sources: BTreeMap<String, f64>,
     pub sinks: BTreeMap<String, f64>,
     pub fuel_power_w: f64,
+    pub excess: BTreeMap<String, f64>,
 }
 
 struct NodeModel {
@@ -329,7 +335,13 @@ fn model_node(ds: &Dataset, n: &NodeReq) -> NodeModel {
     nm
 }
 
-pub fn solve(ds: &Dataset, req: &SolveReq) -> SolveResp {
+pub fn solve(ds: &Dataset, req_in: &SolveReq) -> SolveResp {
+    // Canonical order: the result must not depend on the order nodes/links were created in
+    // (and never on canvas position). Sort everything by id before building the LP.
+    let mut req = req_in.clone();
+    req.nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    req.links.sort_by(|a, b| a.id.cmp(&b.id));
+    let req = &req;
     let models: Vec<NodeModel> = req.nodes.iter().map(|n| model_node(ds, n)).collect();
     let idx: HashMap<&str, usize> = req.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
 
@@ -344,24 +356,44 @@ pub fn solve(ds: &Dataset, req: &SolveReq) -> SolveResp {
         if ok { valid_links.push(l) } else { bad_links += 1 }
     }
     let mut msgs: Vec<String> = Vec::new();
-    let consume: Vec<bool> = req
+    // node modes: explicit target (machines/rate) | demand (default, pull) | supply (push: use all linked input)
+    // A node without its own target whose outputs only feed secondary/tertiary links is not pulled by
+    // anything: it runs on what its inputs provide ("supply-auto") and its output lands on top of demand.
+    let explicit_target = |n: &NodeReq| n.target.as_ref().map(|t| t.kind == "machines" || t.kind == "rate").unwrap_or(false);
+    let modes: Vec<String> = req
         .nodes
         .iter()
         .zip(models.iter())
-        .map(|(n, m)| m.special.as_deref() == Some("sink") || n.target.as_ref().map(|t| t.kind == "consume").unwrap_or(false))
+        .map(|(n, m)| {
+            if let Some(sp) = &m.special {
+                return sp.clone();
+            }
+            if explicit_target(n) {
+                return "target".into();
+            }
+            if n.target.as_ref().map(|t| t.kind == "consume" || t.kind == "supply").unwrap_or(false) {
+                return "supply".into();
+            }
+            let outl: Vec<&&LinkReq> = valid_links.iter().filter(|l| l.from.node == n.id).collect();
+            if !outl.is_empty() && outl.iter().all(|l| prio(l) >= 2) {
+                return "supply-auto".into();
+            }
+            "demand".into()
+        })
         .collect();
-    let has_target = req.nodes.iter().any(|n| n.target.as_ref().map(|t| t.kind != "consume").unwrap_or(false));
+    let supply: Vec<bool> = modes.iter().map(|m| m == "sink" || m == "supply" || m == "supply-auto").collect();
+    let has_target = req.nodes.iter().any(|n| n.target.as_ref().map(|t| t.kind == "machines" || t.kind == "rate").unwrap_or(false));
 
-    // phase 1: normal solve, "consume" nodes act like untargeted nodes
-    let ph1 = match run_lp(req, &models, &valid_links, None, &mut msgs) {
+    let ctx = Ctx { req, models: &models, links: &valid_links, supply: &supply };
+    // Phase A (demand): supply-mode nodes are off; everything else is sized by targets + downstream demand.
+    let ph1 = match ctx.phase_a(&mut msgs) {
         Ok(v) => v,
         Err(e) => return fail(e),
     };
-    // phase 2: freeze everything else, let "consume" nodes eat the leftovers
-    let sol = if consume.iter().any(|c| *c) {
-        let fixed: Vec<Option<f64>> = (0..req.nodes.len()).map(|i| if consume[i] { None } else { Some(ph1.x[i]) }).collect();
-        let mut m2 = Vec::new();
-        match run_lp(req, &models, &valid_links, Some(&fixed), &mut m2) {
+    // Phase B (supply): freeze phase-A sizes, let supply-mode nodes use what is available on their inputs.
+    let need_b = supply.iter().any(|c| *c) || valid_links.iter().any(|l| prio(l) >= 2);
+    let sol = if need_b {
+        match ctx.phase_b(&ph1, &mut msgs) {
             Ok(v) => v,
             Err(e) => return fail(e),
         }
@@ -374,7 +406,7 @@ pub fn solve(ds: &Dataset, req: &SolveReq) -> SolveResp {
     if !has_target && !req.nodes.is_empty() {
         msgs.push("no target set: set a target rate or machine count on at least one node".into());
     }
-    let clean = |v: f64| if v.abs() < 1e-9 { 0.0 } else { v };
+    let clean = |v: f64| if v.abs() < 1e-7 { 0.0 } else { v };
 
     let mut raw_inputs = BTreeMap::new();
     let mut outputs = BTreeMap::new();
@@ -384,6 +416,7 @@ pub fn solve(ds: &Dataset, req: &SolveReq) -> SolveResp {
     let mut fuel_power = 0.0;
     let mut sources = BTreeMap::new();
     let mut sinks = BTreeMap::new();
+    let mut excess = BTreeMap::new();
     let mut nodes_out = Vec::new();
     for (ni, m) in models.iter().enumerate() {
         let x = clean(sol.x[ni]);
@@ -425,6 +458,7 @@ pub fn solve(ds: &Dataset, req: &SolveReq) -> SolveResp {
             fuel: m.fuel.clone(),
             fuel_per_machine: m.fuel_rate,
             burnt: m.burnt.clone(),
+            mode: modes[ni].clone(),
             ..Default::default()
         };
         for (item, per) in &m.ins {
@@ -434,11 +468,15 @@ pub fn solve(ds: &Dataset, req: &SolveReq) -> SolveResp {
             if m.special.is_some() {
             } else if sv.is_none() {
                 *raw_inputs.entry(item.clone()).or_insert(0.0) += rate;
-            } else if slack > 1e-9 {
+            } else if slack > 1e-7 {
                 *deficits.entry(item.clone()).or_insert(0.0) += slack;
                 *raw_inputs.entry(item.clone()).or_insert(0.0) += slack;
             }
-            no.inputs.push(PortOut { item: item.clone(), rate, per_machine: *per, linked: sv.is_some(), slack });
+            let ex = clean(sol.over.get(&(ni, item.clone())).copied().unwrap_or(0.0));
+            if ex > 1e-7 {
+                *excess.entry(item.clone()).or_insert(0.0) += ex;
+            }
+            no.inputs.push(PortOut { item: item.clone(), rate, per_machine: *per, linked: sv.is_some(), slack, excess: ex });
         }
         for (item, per) in &m.outs {
             let sv = sol.slack.get(&(ni, false, item.clone()));
@@ -448,7 +486,7 @@ pub fn solve(ds: &Dataset, req: &SolveReq) -> SolveResp {
             if free > 1e-9 && m.special.is_none() {
                 *outputs.entry(item.clone()).or_insert(0.0) += free;
             }
-            no.outputs.push(PortOut { item: item.clone(), rate, per_machine: *per, linked: sv.is_some(), slack });
+            no.outputs.push(PortOut { item: item.clone(), rate, per_machine: *per, linked: sv.is_some(), slack, excess: 0.0 });
         }
         nodes_out.push(no);
     }
@@ -470,6 +508,7 @@ pub fn solve(ds: &Dataset, req: &SolveReq) -> SolveResp {
         sources,
         sinks,
         fuel_power_w: fuel_power,
+        excess,
     }
 }
 
@@ -487,6 +526,7 @@ fn fail(e: String) -> SolveResp {
         sources: BTreeMap::new(),
         sinks: BTreeMap::new(),
         fuel_power_w: 0.0,
+        excess: BTreeMap::new(),
     }
 }
 
@@ -494,91 +534,237 @@ struct LpSol {
     x: Vec<f64>,
     f: Vec<f64>,
     slack: HashMap<(usize, bool, String), f64>,
+    over: HashMap<(usize, String), f64>,
 }
 
-fn run_lp(req: &SolveReq, models: &[NodeModel], links: &[&LinkReq], fixed: Option<&[Option<f64>]>, msgs: &mut Vec<String>) -> Result<LpSol, String> {
-    const DEFICIT_COST: f64 = 1e6;
-    const SURPLUS_COST: f64 = 1e-3;
-    let mut p = Problem::new(OptimizationDirection::Minimize);
-    let xs: Vec<Variable> = (0..req.nodes.len())
-        .map(|i| {
-            let sp = models[i].special.as_deref();
-            let c = match fixed {
-                Some(fx) if fx[i].is_none() => -1.0, // phase 2: maximise "consume"/sink nodes
-                Some(_) => 0.0,
-                None => match sp {
-                    Some("source") => 1e-3, // per unit/s drawn
-                    Some("sink") => 0.0,
-                    _ => 1.0,
-                },
+// ---------------- lexicographic LP engine ----------------
+#[derive(Clone)]
+struct Lp {
+    nvars: usize,
+    bounds: Vec<(f64, f64)>,
+    cons: Vec<(Vec<(usize, f64)>, ComparisonOp, f64)>,
+}
+impl Lp {
+    fn var(&mut self, lo: f64, hi: f64) -> usize {
+        self.bounds.push((lo, hi));
+        self.nvars += 1;
+        self.nvars - 1
+    }
+    fn solve(&self, obj: &[(usize, f64)]) -> Result<Vec<f64>, String> {
+        let mut c = vec![0.0; self.nvars];
+        for (v, w) in obj {
+            c[*v] += *w;
+        }
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let vars: Vec<Variable> = (0..self.nvars).map(|i| p.add_var(c[i], self.bounds[i])).collect();
+        for (e, op, rhs) in &self.cons {
+            let ex: Vec<(Variable, f64)> = e.iter().map(|(i, w)| (vars[*i], *w)).collect();
+            p.add_constraint(ex.as_slice(), *op, *rhs);
+        }
+        let sol = p.solve().map_err(|e| format!("{e}"))?;
+        Ok(vars.iter().map(|v| sol[*v]).collect())
+    }
+    /// Minimise each objective in turn, keeping earlier optima (within tolerance).
+    fn lexi(&mut self, stages: &[Vec<(usize, f64)>]) -> Result<Vec<f64>, String> {
+        let mut last = None;
+        for (k, obj) in stages.iter().enumerate() {
+            if obj.is_empty() {
+                continue;
+            }
+            let v = match self.solve(obj) {
+                Ok(v) => v,
+                Err(e) if k == 0 || last.is_none() => return Err(e),
+                Err(_) => break, // numerical trouble in a tie-break stage: keep previous optimum
             };
-            p.add_var(c, (0.0, f64::INFINITY))
-        })
-        .collect();
-    let fv: Vec<Variable> = links.iter().map(|_| p.add_var(0.0, (0.0, f64::INFINITY))).collect();
-    let mut slack_vars: Vec<((usize, bool, String), Variable)> = Vec::new();
-    for (ni, m) in models.iter().enumerate() {
-        let nid = &req.nodes[ni].id;
-        for (dir_in, ports) in [(true, &m.ins), (false, &m.outs)] {
-            for (item, per) in ports.iter() {
-                let ls: Vec<Variable> = links
-                    .iter()
-                    .zip(fv.iter())
-                    .filter(|(l, _)| if dir_in { &l.to.node == nid && &l.to.item == item } else { &l.from.node == nid && &l.from.item == item })
-                    .map(|x| *x.1)
-                    .collect();
-                if ls.is_empty() {
-                    continue;
-                }
-                let s = p.add_var(if dir_in { DEFICIT_COST } else { SURPLUS_COST }, (0.0, f64::INFINITY));
-                slack_vars.push(((ni, dir_in, item.clone()), s));
-                let mut expr: Vec<(Variable, f64)> = ls.iter().map(|v| (*v, 1.0)).collect();
-                expr.push((s, 1.0));
-                expr.push((xs[ni], -per));
-                p.add_constraint(expr.as_slice(), ComparisonOp::Eq, 0.0);
-            }
+            let val: f64 = obj.iter().map(|(i, w)| v[*i] * w).sum();
+            let tol = if val.abs() < 1e-9 { 0.0 } else { 1e-9 * val.abs().max(1.0) };
+            self.cons.push((obj.clone(), ComparisonOp::Le, val.max(0.0_f64.min(val)) + tol));
+            last = Some(v);
         }
-        if m.err.is_some() && m.ins.is_empty() && m.outs.is_empty() {
-            p.add_constraint(&[(xs[ni], 1.0)], ComparisonOp::Eq, 0.0);
+        match last {
+            Some(v) => Ok(v),
+            None => self.solve(&[]),
         }
     }
-    for (ni, n) in req.nodes.iter().enumerate() {
-        if models[ni].special.is_some() && fixed.is_none() {
-            continue; // sources/sinks have no targets
-        }
-        if let Some(fx) = fixed {
-            if let Some(v) = fx[ni] {
-                p.add_constraint(&[(xs[ni], 1.0)], ComparisonOp::Eq, v);
-            } else if !models[ni].ins.iter().any(|(it, _)| links.iter().any(|l| &l.to.node == &n.id && &l.to.item == it)) {
-                if models[ni].special.is_none() {
-                    msgs.push(format!("'consume' node {} has no linked input", n.id));
+}
+
+struct Ctx<'a> {
+    req: &'a SolveReq,
+    models: &'a [NodeModel],
+    links: &'a [&'a LinkReq],
+    supply: &'a [bool],
+}
+struct Built {
+    lp: Lp,
+    xs: Vec<usize>,
+    fv: Vec<usize>,
+    slack: Vec<((usize, bool, String), usize)>,
+    over: Vec<((usize, String), usize)>,
+}
+fn prio(l: &LinkReq) -> u8 {
+    l.priority.unwrap_or(1).clamp(1, 3)
+}
+const MAXP: u8 = 3;
+impl<'a> Ctx<'a> {
+    /// `prev` = phase-A solution when building phase B: non-supply node sizes and primary flows into
+    /// non-supply nodes are frozen, so secondary supply can only add on top.
+    fn build(&self, prev: Option<&LpSol>, msgs: &mut Vec<String>) -> Built {
+        let mut lp = Lp { nvars: 0, bounds: vec![], cons: vec![] };
+        let n = self.req.nodes.len();
+        let idx: HashMap<&str, usize> = self.req.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
+        let xs: Vec<usize> = (0..n).map(|_| lp.var(0.0, f64::INFINITY)).collect();
+        let fv: Vec<usize> = self
+            .links
+            .iter()
+            .enumerate()
+            .map(|(li, l)| {
+                let to_supply = idx.get(l.to.node.as_str()).map(|i| self.supply[*i]).unwrap_or(false);
+                match prev {
+                    // demand pass: only primary links carry demand
+                    None if prio(l) >= 2 => lp.var(0.0, 0.0),
+                    Some(p) if prio(l) == 1 && !to_supply => {
+                        let v = p.f[li].max(0.0);
+                        lp.var(v, v)
+                    }
+                    _ => lp.var(0.0, f64::INFINITY),
                 }
-                p.add_constraint(&[(xs[ni], 1.0)], ComparisonOp::Eq, 0.0);
-            }
-            continue;
-        }
-        let Some(t) = &n.target else { continue };
-        if !(t.value.is_finite() && t.value >= 0.0) {
-            continue;
-        }
-        match t.kind.as_str() {
-            "consume" => {}
-            "machines" => p.add_constraint(&[(xs[ni], 1.0)], ComparisonOp::Eq, t.value),
-            _ => {
-                let item = t.item.clone().or_else(|| models[ni].outs.first().map(|x| x.0.clone()));
-                let Some(item) = item else { continue };
-                let per = models[ni].outs.iter().chain(models[ni].ins.iter()).find(|(n, _)| *n == item).map(|x| x.1);
-                match per {
-                    Some(per) if per > 0.0 => p.add_constraint(&[(xs[ni], per)], ComparisonOp::Eq, t.value),
-                    _ => msgs.push(format!("target item {item} not produced by node {}", n.id)),
+            })
+            .collect();
+        let mut slack = Vec::new();
+        let mut over = Vec::new();
+        for (ni, m) in self.models.iter().enumerate() {
+            let nid = &self.req.nodes[ni].id;
+            for (dir_in, ports) in [(true, &m.ins), (false, &m.outs)] {
+                for (item, per) in ports.iter() {
+                    let pl: Vec<(&&LinkReq, usize)> = self
+                        .links
+                        .iter()
+                        .zip(fv.iter())
+                        .filter(|(l, _)| if dir_in { &l.to.node == nid && &l.to.item == item } else { &l.from.node == nid && &l.from.item == item })
+                        .map(|(l, v)| (l, *v))
+                        .collect();
+                    if pl.is_empty() {
+                        continue;
+                    }
+                    // supply-mode nodes may not "import" missing input: they only use what arrives
+                    let hi = if dir_in && self.supply[ni] { 0.0 } else { f64::INFINITY };
+                    let s = lp.var(0.0, hi);
+                    slack.push(((ni, dir_in, item.clone()), s));
+                    let mut e: Vec<(usize, f64)> = pl.iter().map(|(_, v)| (*v, 1.0)).collect();
+                    e.push((s, 1.0));
+                    e.push((xs[ni], -per));
+                    if dir_in && !self.supply[ni] && pl.iter().any(|(l, _)| prio(l) >= 2) {
+                        let o = lp.var(0.0, if prev.is_some() { f64::INFINITY } else { 0.0 });
+                        over.push(((ni, item.clone()), o));
+                        e.push((o, -1.0));
+                    }
+                    lp.cons.push((e, ComparisonOp::Eq, 0.0));
                 }
             }
+            if m.err.is_some() && m.ins.is_empty() && m.outs.is_empty() {
+                lp.cons.push((vec![(xs[ni], 1.0)], ComparisonOp::Eq, 0.0));
+            }
+        }
+        for (ni, node) in self.req.nodes.iter().enumerate() {
+            let m = &self.models[ni];
+            if self.supply[ni] {
+                let has_linked_in = m.ins.iter().any(|(it, _)| self.links.iter().any(|l| l.to.node == node.id && &l.to.item == it));
+                if prev.is_none() || !has_linked_in {
+                    if prev.is_some() && m.special.is_none() {
+                        msgs.push(format!("supply-mode node {} has no linked input", node.id));
+                    }
+                    lp.cons.push((vec![(xs[ni], 1.0)], ComparisonOp::Eq, 0.0));
+                } else {
+                    lp.bounds[xs[ni]].1 = 1e7; // safety against loops with gain > 1
+                }
+                continue;
+            }
+            if let Some(p) = prev {
+                let v = p.x[ni].max(0.0);
+                lp.bounds[xs[ni]] = (v, v);
+                continue;
+            }
+            if m.special.is_some() {
+                continue;
+            }
+            let Some(t) = &node.target else { continue };
+            if !(t.value.is_finite() && t.value >= 0.0) {
+                continue;
+            }
+            match t.kind.as_str() {
+                "machines" => lp.cons.push((vec![(xs[ni], 1.0)], ComparisonOp::Eq, t.value)),
+                "rate" => {
+                    let item = t.item.clone().or_else(|| m.outs.first().map(|x| x.0.clone()));
+                    let Some(item) = item else { continue };
+                    let per = m.outs.iter().chain(m.ins.iter()).find(|(n, _)| *n == item).map(|x| x.1);
+                    match per {
+                        Some(per) if per > 0.0 => lp.cons.push((vec![(xs[ni], per)], ComparisonOp::Eq, t.value)),
+                        _ => msgs.push(format!("target item {item} not produced by node {}", node.id)),
+                    }
+                }
+                _ => {}
+            }
+        }
+        Built { lp, xs, fv, slack, over }
+    }
+    fn deficits(&self, b: &Built) -> Vec<(usize, f64)> {
+        b.slack.iter().filter(|((_, d, _), _)| *d).map(|(_, v)| (*v, 1.0)).collect()
+    }
+    fn prio_flows(&self, b: &Built, k: u8, sign: f64, only_into_supply: bool) -> Vec<(usize, f64)> {
+        let idx: HashMap<&str, usize> = self.req.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
+        self.links
+            .iter()
+            .zip(b.fv.iter())
+            .filter(|(l, _)| prio(l) == k && (!only_into_supply || idx.get(l.to.node.as_str()).map(|i| self.supply[*i]).unwrap_or(false)))
+            .map(|(_, v)| (*v, sign))
+            .collect()
+    }
+    fn finish(&self, b: &Built, v: Vec<f64>) -> LpSol {
+        LpSol {
+            x: b.xs.iter().map(|i| v[*i]).collect(),
+            f: b.fv.iter().map(|i| v[*i]).collect(),
+            slack: b.slack.iter().map(|(k, i)| (k.clone(), v[*i])).collect(),
+            over: b.over.iter().map(|(k, i)| (k.clone(), v[*i])).collect(),
         }
     }
-    let sol = p.solve().map_err(|e| format!("solver failed: {e} (conflicting targets?)"))?;
-    Ok(LpSol {
-        x: xs.iter().map(|v| sol[*v]).collect(),
-        f: fv.iter().map(|v| sol[*v]).collect(),
-        slack: slack_vars.into_iter().map(|(k, v)| (k, sol[v])).collect(),
-    })
+    /// demand pass: targets are met through PRIMARY links only:
+    /// 1) meet demand (min deficits) 2) fewest machines (pull sizing), tiny cost on infinite sources / surplus
+    fn phase_a(&self, msgs: &mut Vec<String>) -> Result<LpSol, String> {
+        let mut b = self.build(None, msgs);
+        let mut size: Vec<(usize, f64)> = Vec::new();
+        for (i, m) in self.models.iter().enumerate() {
+            let w = match m.special.as_deref() {
+                Some("source") => 1e-3,
+                Some(_) => 0.0,
+                None => 1.0,
+            };
+            if w > 0.0 {
+                size.push((b.xs[i], w));
+            }
+        }
+        for ((_, d, _), v) in &b.slack {
+            if !*d {
+                size.push((*v, 1e-3));
+            }
+        }
+        let stages = vec![self.deficits(&b), size];
+        let v = b.lp.lexi(&stages).map_err(|e| format!("solver failed: {e} (conflicting targets?)"))?;
+        Ok(self.finish(&b, v))
+    }
+    /// supply pass: demand sizes + primary flows frozen. Supply-mode nodes run on what reaches their
+    /// inputs (primary links first), then secondary/tertiary links push leftovers on top of demand:
+    /// first into any remaining shortfall, the rest shows up as excess (over-production).
+    fn phase_b(&self, a: &LpSol, msgs: &mut Vec<String>) -> Result<LpSol, String> {
+        let mut b = self.build(Some(a), msgs);
+        let mut stages = vec![self.deficits(&b)];
+        for k in 1..=MAXP {
+            stages.push(self.prio_flows(&b, k, -1.0, true));
+        }
+        stages.push(self.supply.iter().enumerate().filter(|(_, s)| **s).map(|(i, _)| (b.xs[i], -1.0)).collect());
+        for k in 2..=MAXP {
+            stages.push(self.prio_flows(&b, k, -1.0, false));
+        }
+        let v = b.lp.lexi(&stages).map_err(|e| format!("solver failed in supply pass: {e}"))?;
+        Ok(self.finish(&b, v))
+    }
 }
