@@ -393,6 +393,10 @@ pub fn solve(ds: &Dataset, req_in: &SolveReq) -> SolveResp {
                 if sp == "sink" && n.target.as_ref().map_or(false, |t| t.kind == "rate" && t.value > 0.0) {
                     return "sink-target".into();
                 }
+                // an infinite source with a fixed rate (e.g. a mine's output) drives the chain forward
+                if sp == "source" && n.target.as_ref().map_or(false, |t| t.kind == "rate" && t.value >= 0.0) {
+                    return "source-fixed".into();
+                }
                 return sp.clone();
             }
             if explicit_target(n) {
@@ -744,7 +748,7 @@ impl<'a> Ctx<'a> {
                 lp.bounds[xs[ni]] = ((v - e).max(0.0), v + e);
                 continue;
             }
-            if m.special.as_deref() == Some("source") || (m.special.is_some() && node.target.as_ref().map_or(true, |t| t.kind != "rate")) {
+            if m.special.is_some() && node.target.as_ref().map_or(true, |t| t.kind != "rate") {
                 continue;
             }
             let Some(t) = &node.target else { continue };
@@ -809,6 +813,27 @@ impl<'a> Ctx<'a> {
         }
         // "use what you linked": output that has a primary link should be consumed, not wasted, before
         // minimising machine count (lets byproduct recycles / supply-mode recyclers reduce upstream demand)
+        // nodes downstream (over primary links) of a fixed-rate source are pushed: what the source delivers
+        // flows on through every primary link instead of being left over, so they size from supply
+        let n = self.req.nodes.len();
+        let pos = |id: &str| self.req.nodes.iter().position(|x| x.id == id);
+        let mut pushed: Vec<bool> = (0..n)
+            .map(|i| self.models[i].special.as_deref() == Some("source") && self.req.nodes[i].target.as_ref().map_or(false, |t| t.kind == "rate"))
+            .collect();
+        loop {
+            let mut ch = false;
+            for l in self.links.iter().filter(|l| prio(l) == 1) {
+                if let (Some(a), Some(t)) = (pos(&l.from.node), pos(&l.to.node)) {
+                    if pushed[a] && !pushed[t] && self.models[t].special.is_none() {
+                        pushed[t] = true;
+                        ch = true;
+                    }
+                }
+            }
+            if !ch {
+                break;
+            }
+        }
         let waste: Vec<(usize, f64)> = b
             .slack
             .iter()
@@ -817,7 +842,7 @@ impl<'a> Ctx<'a> {
                     prio(l) == 1
                         && l.from.node == self.req.nodes[*ni].id
                         && &l.from.item == item
-                        && self.req.nodes.iter().position(|x| x.id == l.to.node).map_or(false, |t| self.supply[t])
+                        && (pushed[*ni] || pos(&l.to.node).map_or(false, |t| self.supply[t]))
                 })
             })
             .map(|(_, v)| (*v, 1.0))

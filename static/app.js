@@ -167,7 +167,7 @@ function renderSidebar() {
   const list = $('#list'); list.innerHTML = '';
   if (tab === 'machines') {
     const groups = new Map();
-    const specials = [['source', '∞ Infinite source', 'Supplies unlimited amounts of one item/fluid to whatever it is linked to'], ['sink', '⤓ Infinite sink', 'Swallows everything linked into it (dump byproducts), or set a desired rate it pulls like a target']]
+    const specials = [['source', '∞ Infinite source', 'Supplies unlimited amounts of one item/fluid to whatever it is linked to, or a fixed rate (your mine output) that everything downstream sizes from'], ['sink', '⤓ Infinite sink', 'Swallows everything linked into it (dump byproducts), or set a desired rate it pulls like a target']]
       .filter(([, n]) => !q || n.toLowerCase().includes(q) || 'infinite source sink'.includes(q));
     if (specials.length) {
       const b = el('div', { class: 'grp-b' });
@@ -277,14 +277,18 @@ function renderSpecial(n) {
     ports.append(src ? el('div', { class: 'pcol in' }) : col, src ? col : el('div', { class: 'pcol out' }));
     box.append(ports);
   }
-  if (!src) {
+  {
     // infinite sink: "take everything" (default) or a desired incoming rate that drives the chain like a target
-    const want = n.target?.kind === 'rate' && n.target.value > 0;
+    // infinite source: "unlimited" (default) or a fixed rate (e.g. a mine's output) that is pushed downstream
+    const want = n.target?.kind === 'rate' && (src ? n.target.value >= 0 : n.target.value > 0);
     const f = el('div', { class: 'node-f' });
-    const sel = el('select', { class: 'modesel', 'data-tip': 'take everything – swallows whatever arrives\nwant rate – this sink wants a fixed rate and pulls it through primary links (like a target)' },
-      el('option', { value: '' }, 'take everything'), el('option', { value: 'rate' }, 'want rate'));
+    const sel = src
+      ? el('select', { class: 'modesel', 'data-tip': 'unlimited – supplies whatever is demanded\nfixed rate – delivers exactly this rate (e.g. your mine output) and pushes it through primary links; demand nodes downstream size themselves from it' },
+        el('option', { value: '' }, 'unlimited'), el('option', { value: 'rate' }, 'fixed rate'))
+      : el('select', { class: 'modesel', 'data-tip': 'take everything – swallows whatever arrives\nwant rate – this sink wants a fixed rate and pulls it through primary links (like a target)' },
+        el('option', { value: '' }, 'take everything'), el('option', { value: 'rate' }, 'want rate'));
     sel.value = want ? 'rate' : '';
-    sel.onchange = () => { n.target = sel.value ? { kind: 'rate', item: n.item, value: n.target?.value > 0 ? n.target.value : 1 / unit() } : null; changed(); };
+    sel.onchange = () => { n.target = sel.value ? { kind: 'rate', item: n.item, value: n.target?.value > 0 ? n.target.value : (src && res?.machines > 1e-9 ? +res.machines.toPrecision(4) : 1 / unit()) } : null; changed(); };
     sel.addEventListener('mousedown', (e) => e.stopPropagation());
     f.append(sel);
     if (want) {
@@ -294,7 +298,11 @@ function renderSpecial(n) {
       f.append(inp, el('span', {}, unitLabel()));
     }
     box.append(f);
-    if (want) box.append(el('div', {}, modeBadge(n, res)));
+    if (want) {
+      const op = res?.outputs?.[0];
+      box.append(el('div', { class: 'spbal' }, modeBadge(n, res),
+        src && op?.slack > 1e-7 ? el('span', { class: 'bal over', 'data-tip': 'Not taken by anything downstream' }, `${fmt(op.slack * unit())}${unitLabel()} unused`) : ''));
+    }
   }
   for (const h of nodeHints(n, res)) box.append(hintEl(h));
   return box;
@@ -390,8 +398,9 @@ function nodeLabel(n) {
   const r = D.recipes[n.recipe];
   return (D.machines[n.machine]?.n || n.machine) + (r ? ` (${r.n})` : '');
 }
-function chainTargets(n) {
-  // explicit targets in the same linked group (links taken as undirected)
+function chainTargets(n) { return chainNodes(n).filter(isExplicitTarget); }
+function chainNodes(n) {
+  // all nodes in the same linked group (links taken as undirected)
   const seen = new Set([n.id]), st = [n.id];
   while (st.length) {
     const id = st.pop();
@@ -400,16 +409,23 @@ function chainTargets(n) {
       if (o && !seen.has(o)) { seen.add(o); st.push(o); }
     }
   }
-  return S.nodes.filter((x) => seen.has(x.id) && isExplicitTarget(x));
+  return S.nodes.filter((x) => seen.has(x.id));
 }
 function nodeHints(n, res) {
   const out = [];
   const isSupply = n.target?.kind === 'supply' || n.target?.kind === 'consume';
   const linkedIn = S.links.filter((l) => l.to.node === n.id);
   if (isSupply && !linkedIn.length) out.push({ text: 'Supply mode, but nothing is linked into this node, so it runs at 0. Link its input or switch it to demand.', fix: ['switch to demand', () => { n.target = null; changed(); }] });
+  if (n.kind === 'source' && n.target?.kind === 'rate' && R) {
+    // short somewhere downstream although the source is fixed -> the source is too small for a target there
+    const comp = chainNodes(n);
+    let short = 0;
+    for (const x of comp) for (const p of nodeResult(x)?.inputs || []) if (p.slack > 1e-7 && S.links.some((l) => l.to.node === x.id && l.to.item === p.item)) short += p.slack;
+    if (short > 1e-7) out.push({ text: `Something downstream is short (${fmt(short * unit())}${unitLabel()} in total): a target there needs more than ${fmt(n.target.value * unit())}${unitLabel()} can feed. Raise the rate, or remove that target and let everything size from this source.` });
+  }
   if (isExplicitTarget(n)) {
     const ts = chainTargets(n);
-    if (ts.length > 1) out.push({ text: `${ts.length} targets in this chain (${ts.filter((x) => x !== n).map(nodeLabel).join(', ')} too). They can fight each other: whatever one target makes beyond what the other needs shows up as surplus, or as short. Usually keep one target and set the others to demand.`, fix: ['make this one demand', () => { n.target = null; changed(); }] });
+    if (ts.length > 1) out.push({ text: `${ts.length} targets in this chain (${ts.filter((x) => x !== n).map(nodeLabel).join(', ')} too). They can fight each other: whatever one target makes beyond what the other needs shows up as surplus, or as short. Usually keep one target and set the others to demand.`, fix: [n.kind === 'source' ? 'make unlimited' : n.kind === 'sink' ? 'take everything' : 'make this one demand', () => { n.target = null; changed(); }] });
   }
   for (const p of res?.inputs || []) {
     if (!(p.slack > 1e-7)) continue;
@@ -434,6 +450,7 @@ function modeBadge(n, res) {
     demand: ['◀ DEMAND', 'Sized by what its linked consumers pull (primary links)'],
     supply: ['▶ SUPPLY', 'Uses everything that reaches its linked inputs (primary links); it is still pulled through when it sits between a demand and its supplier'],
     'sink-target': ['TARGET', 'Desired rate into this sink – drives everything linked to it'],
+    'source-fixed': ['▶ FIXED', 'Fixed supply – pushed downstream through primary links; demand nodes there size themselves from it'],
     'supply-auto': ['▶ SUPPLY (auto)', 'Only feeds secondary links, so nothing pulls it: it runs on what its inputs provide and adds on top'],
   }[mode] || [mode.toUpperCase(), ''];
   return el('span', { class: 'mode ' + mode, 'data-tip': info[1] }, info[0]);

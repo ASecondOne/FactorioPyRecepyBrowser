@@ -169,3 +169,5 @@ input[type=number]{width:70px}
 .node.special .node-f { display: flex; gap: 6px; align-items: center; }
 .node.special .tval { width: 70px; }
 .mode.sink-target { background: #8a5a12; color: #ffe2a8; }
+.spbal { display: flex; gap: 6px; align-items: center; padding: 2px 8px 6px; }
+.mode.source-fixed { background: #1f5a3a; color: #b8f5cf; }

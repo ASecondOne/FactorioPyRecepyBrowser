@@ -54,3 +54,10 @@ Base numbers stay exactly the demand-driven ones; toggle off = no change at all.
 - Yellow hints on nodes explain common setup problems, with a one-click fix: supply node with nothing linked
   into it, several targets in one chain, an input short because it is only fed by secondary links.
 - The current canvas is also autosaved server-side to `layouts/_autosave.json` (2 s after a change and on load).
+
+### Fixed-rate infinite source
+
+An infinite source can be "unlimited" (default: supplies whatever is demanded) or "fixed rate" (e.g. your mine
+output, 15/s). A fixed source pushes exactly that rate downstream through its primary links; demand nodes there
+size themselves from it, so you can balance machines around a mine. If a target further down conflicts, the
+source shows "x/s unused" or a hint that something downstream is short.
