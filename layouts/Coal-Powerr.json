@@ -1,0 +1,262 @@
+{
+ "version": 1,
+ "nodes": [
+  {
+   "id": "na7tf",
+   "x": 1060,
+   "y": 260,
+   "machine": "py-heat-exchanger",
+   "recipe": "he-01",
+   "modules": [],
+   "fuel": null,
+   "extra_speed": 0,
+   "extra_prod": 0,
+   "target": {
+    "kind": "rate",
+    "item": "pressured-steam",
+    "value": 20
+   }
+  },
+  {
+   "id": "ngwsw",
+   "x": 480,
+   "y": 260,
+   "machine": "py-coal-powerplant-mk01",
+   "recipe": "coal-molten-salt-01",
+   "modules": [],
+   "fuel": "coal",
+   "extra_speed": 0,
+   "extra_prod": 0,
+   "target": null
+  },
+  {
+   "id": "nk03h",
+   "x": -140,
+   "y": 260,
+   "machine": "secondary-crusher-mk01",
+   "recipe": "crushed-coal",
+   "modules": [],
+   "fuel": null,
+   "extra_speed": 0,
+   "extra_prod": 0,
+   "target": null
+  },
+  {
+   "id": "nmuxg",
+   "x": -140,
+   "y": 560,
+   "machine": "automated-screener-mk01",
+   "recipe": "coarse-coal",
+   "modules": [],
+   "fuel": null,
+   "extra_speed": 0,
+   "extra_prod": 0,
+   "target": null
+  },
+  {
+   "id": "npjf7",
+   "x": -140,
+   "y": 840,
+   "machine": "secondary-crusher-mk01",
+   "recipe": "coarse-coal-to-coal",
+   "modules": [],
+   "fuel": null,
+   "extra_speed": 0,
+   "extra_prod": 0,
+   "target": null
+  },
+  {
+   "id": "nsqlr",
+   "x": 480,
+   "y": 560,
+   "machine": "py-coal-powerplant-mk01",
+   "recipe": "coal-molten-salt-01",
+   "modules": [],
+   "fuel": "coal-dust",
+   "extra_speed": 0,
+   "extra_prod": 0,
+   "target": null
+  },
+  {
+   "id": "nwnpa",
+   "x": -720,
+   "y": 260,
+   "machine": "hpf",
+   "recipe": "coal-fawogae",
+   "modules": [],
+   "fuel": null,
+   "extra_speed": 0,
+   "extra_prod": 0,
+   "target": null
+  },
+  {
+   "id": "nydp4",
+   "x": -1120,
+   "y": 260,
+   "machine": "fawogae-plantation-mk01",
+   "recipe": "fawogae-1",
+   "modules": [
+    {
+     "name": "fawogae",
+     "count": 10
+    }
+   ],
+   "fuel": null,
+   "extra_speed": 0,
+   "extra_prod": 0,
+   "target": null
+  },
+  {
+   "id": "n10izr",
+   "x": -1500,
+   "y": 260,
+   "machine": "spore-collector-mk01",
+   "recipe": "fawogae-spore",
+   "modules": [],
+   "fuel": null,
+   "extra_speed": 0,
+   "extra_prod": 0,
+   "target": null
+  }
+ ],
+ "links": [
+  {
+   "id": "lnhouu",
+   "from": {
+    "node": "ngwsw",
+    "item": "hot-molten-salt"
+   },
+   "to": {
+    "node": "na7tf",
+    "item": "hot-molten-salt"
+   }
+  },
+  {
+   "id": "lnl65p",
+   "from": {
+    "node": "nk03h",
+    "item": "coal"
+   },
+   "to": {
+    "node": "ngwsw",
+    "item": "coal"
+   }
+  },
+  {
+   "id": "lnnjqr",
+   "from": {
+    "node": "nk03h",
+    "item": "crushed-coal"
+   },
+   "to": {
+    "node": "nmuxg",
+    "item": "crushed-coal"
+   }
+  },
+  {
+   "id": "lnolh2",
+   "from": {
+    "node": "nmuxg",
+    "item": "coal"
+   },
+   "to": {
+    "node": "ngwsw",
+    "item": "coal"
+   }
+  },
+  {
+   "id": "lnq6yx",
+   "from": {
+    "node": "nmuxg",
+    "item": "coarse-coal"
+   },
+   "to": {
+    "node": "npjf7",
+    "item": "coarse-coal"
+   }
+  },
+  {
+   "id": "lnr5ab",
+   "from": {
+    "node": "npjf7",
+    "item": "coal"
+   },
+   "to": {
+    "node": "ngwsw",
+    "item": "coal"
+   }
+  },
+  {
+   "id": "lnt7uy",
+   "from": {
+    "node": "nmuxg",
+    "item": "coal-dust"
+   },
+   "to": {
+    "node": "nsqlr",
+    "item": "coal-dust"
+   }
+  },
+  {
+   "id": "lnut5k",
+   "from": {
+    "node": "nk03h",
+    "item": "coal-dust"
+   },
+   "to": {
+    "node": "nsqlr",
+    "item": "coal-dust"
+   }
+  },
+  {
+   "id": "lnvg7z",
+   "from": {
+    "node": "nsqlr",
+    "item": "hot-molten-salt"
+   },
+   "to": {
+    "node": "na7tf",
+    "item": "hot-molten-salt"
+   }
+  },
+  {
+   "id": "lnx2sa",
+   "from": {
+    "node": "nwnpa",
+    "item": "raw-coal"
+   },
+   "to": {
+    "node": "nk03h",
+    "item": "raw-coal"
+   }
+  },
+  {
+   "id": "lnzvmw",
+   "from": {
+    "node": "nydp4",
+    "item": "fawogae"
+   },
+   "to": {
+    "node": "nwnpa",
+    "item": "fawogae"
+   }
+  },
+  {
+   "id": "ln11ise",
+   "from": {
+    "node": "n10izr",
+    "item": "fawogae-spore"
+   },
+   "to": {
+    "node": "nydp4",
+    "item": "fawogae-spore"
+   }
+  }
+ ],
+ "view": {
+  "x": 1162.3891839456915,
+  "y": 198.97614799412702,
+  "z": 0.6730066959373843
+ },
+ "unit": 1
+}
