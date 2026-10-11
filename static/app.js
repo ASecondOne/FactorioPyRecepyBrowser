@@ -167,7 +167,7 @@ function renderSidebar() {
   const list = $('#list'); list.innerHTML = '';
   if (tab === 'machines') {
     const groups = new Map();
-    const specials = [['source', '∞ Infinite source', 'Supplies unlimited amounts of one item/fluid to whatever it is linked to'], ['sink', '⤓ Infinite sink', 'Swallows everything linked into it (dump byproducts)']]
+    const specials = [['source', '∞ Infinite source', 'Supplies unlimited amounts of one item/fluid to whatever it is linked to'], ['sink', '⤓ Infinite sink', 'Swallows everything linked into it (dump byproducts), or set a desired rate it pulls like a target']]
       .filter(([, n]) => !q || n.toLowerCase().includes(q) || 'infinite source sink'.includes(q));
     if (specials.length) {
       const b = el('div', { class: 'grp-b' });
@@ -264,7 +264,7 @@ function renderSpecial(n) {
   const box = el('div', { class: 'node special ' + n.kind + (selNode === n ? ' sel' : ''), 'data-id': n.id });
   box.style.left = n.x + 'px'; box.style.top = n.y + 'px';
   const head = el('div', { class: 'node-h' }, el('span', { class: 'spicon big' }, src ? '∞' : '⤓'),
-    el('div', { class: 'title' }, el('div', { class: 'mname', 'data-tip': 'Click to change item', onclick: (e) => { e.stopPropagation(); openItemPicker('Choose item', (it) => { n.item = it; changed(); }); } }, (src ? 'Infinite source' : 'Infinite sink')),
+    el('div', { class: 'title' }, el('div', { class: 'mname', 'data-tip': 'Click to change item', onclick: (e) => { e.stopPropagation(); openItemPicker('Choose item', (it) => { n.item = it; if (n.target) n.target.item = it; changed(); }); } }, (src ? 'Infinite source' : 'Infinite sink')),
       el('div', { class: 'count' }, res ? fmt(res.machines * unit()) + unitLabel() : '')),
     el('button', { class: 'x', 'data-tip': 'Delete node', onclick: (e) => { e.stopPropagation(); deleteNode(n); } }, '✕'));
   head.addEventListener('mousedown', (e) => startNodeDrag(e, n));
@@ -277,6 +277,26 @@ function renderSpecial(n) {
     ports.append(src ? el('div', { class: 'pcol in' }) : col, src ? col : el('div', { class: 'pcol out' }));
     box.append(ports);
   }
+  if (!src) {
+    // infinite sink: "take everything" (default) or a desired incoming rate that drives the chain like a target
+    const want = n.target?.kind === 'rate' && n.target.value > 0;
+    const f = el('div', { class: 'node-f' });
+    const sel = el('select', { class: 'modesel', 'data-tip': 'take everything – swallows whatever arrives\nwant rate – this sink wants a fixed rate and pulls it through primary links (like a target)' },
+      el('option', { value: '' }, 'take everything'), el('option', { value: 'rate' }, 'want rate'));
+    sel.value = want ? 'rate' : '';
+    sel.onchange = () => { n.target = sel.value ? { kind: 'rate', item: n.item, value: n.target?.value > 0 ? n.target.value : 1 / unit() } : null; changed(); };
+    sel.addEventListener('mousedown', (e) => e.stopPropagation());
+    f.append(sel);
+    if (want) {
+      const inp = el('input', { type: 'number', min: '0', step: 'any', class: 'tval', value: +(n.target.value * unit()).toPrecision(6) });
+      inp.addEventListener('mousedown', (e) => e.stopPropagation());
+      inp.onchange = () => { const v = parseFloat(inp.value); if (v > 0) { n.target = { kind: 'rate', item: n.item, value: v / unit() }; changed(); } };
+      f.append(inp, el('span', {}, unitLabel()));
+    }
+    box.append(f);
+    if (want) box.append(el('div', {}, modeBadge(n, res)));
+  }
+  for (const h of nodeHints(n, res)) box.append(hintEl(h));
   return box;
 }
 function renderNode(n) {
@@ -320,6 +340,7 @@ function renderNode(n) {
     box.append(fr);
   }
   if (res?.warning) box.append(el('div', { class: 'errmsg warn' }, res.warning));
+  for (const h of nodeHints(n, res)) box.append(hintEl(h));
   // footer: target + modules
   const f = el('div', { class: 'node-f' });
   const tsel = el('select', { class: 'modesel', 'data-tip': 'Mode:\n◀ demand – sized by what linked consumers pull (default)\n▶ supply – runs on whatever reaches its linked inputs\n# machines / rate – fixed target that drives the rest' },
@@ -362,12 +383,57 @@ function renderNode(n) {
   }
   return box;
 }
+// ---- setup hints: explain in plain words why a chain comes out at 0 / short / over-constrained ----
+function isExplicitTarget(n) { return !!n.target && (n.target.kind === 'machines' || (n.target.kind === 'rate' && (n.kind !== 'sink' || n.target.value > 0))); }
+function nodeLabel(n) {
+  if (n.kind === 'source' || n.kind === 'sink') return (n.kind === 'source' ? 'Infinite source' : 'Infinite sink') + (n.item ? ` (${itemName(n.item)})` : '');
+  const r = D.recipes[n.recipe];
+  return (D.machines[n.machine]?.n || n.machine) + (r ? ` (${r.n})` : '');
+}
+function chainTargets(n) {
+  // explicit targets in the same linked group (links taken as undirected)
+  const seen = new Set([n.id]), st = [n.id];
+  while (st.length) {
+    const id = st.pop();
+    for (const l of S.links) {
+      const o = l.from.node === id ? l.to.node : l.to.node === id ? l.from.node : null;
+      if (o && !seen.has(o)) { seen.add(o); st.push(o); }
+    }
+  }
+  return S.nodes.filter((x) => seen.has(x.id) && isExplicitTarget(x));
+}
+function nodeHints(n, res) {
+  const out = [];
+  const isSupply = n.target?.kind === 'supply' || n.target?.kind === 'consume';
+  const linkedIn = S.links.filter((l) => l.to.node === n.id);
+  if (isSupply && !linkedIn.length) out.push({ text: 'Supply mode, but nothing is linked into this node, so it runs at 0. Link its input or switch it to demand.', fix: ['switch to demand', () => { n.target = null; changed(); }] });
+  if (isExplicitTarget(n)) {
+    const ts = chainTargets(n);
+    if (ts.length > 1) out.push({ text: `${ts.length} targets in this chain (${ts.filter((x) => x !== n).map(nodeLabel).join(', ')} too). They can fight each other: whatever one target makes beyond what the other needs shows up as surplus, or as short. Usually keep one target and set the others to demand.`, fix: ['make this one demand', () => { n.target = null; changed(); }] });
+  }
+  for (const p of res?.inputs || []) {
+    if (!(p.slack > 1e-7)) continue;
+    const ls = linkedIn.filter((l) => l.to.item === p.item);
+    if (ls.length && ls.every((l) => (l.priority || 1) > 1)) {
+      out.push({ text: `${itemName(p.item)} is short: it is only fed by secondary links, and secondary links never count toward demand. Make one of them primary (P).`, fix: ['make primary', () => { ls[0].priority = 1; changed(); }] });
+    } else if (ls.length) {
+      out.push({ text: `${itemName(p.item)} is short by ${fmt(p.slack * unit())}${unitLabel()}: the linked suppliers can't deliver more (fixed target / machine count, or a supply-mode node with too little input upstream).` });
+    }
+  }
+  return out;
+}
+function hintEl(h) {
+  const d = el('div', { class: 'errmsg warn hint' }, '⚠ ' + h.text);
+  if (h.fix) d.append(' ', el('button', { class: 'fixbtn', onmousedown: (e) => e.stopPropagation(), onclick: (e) => { e.stopPropagation(); h.fix[1](); } }, h.fix[0]));
+  return d;
+}
 function modeBadge(n, res) {
   const mode = res?.mode || (n.target ? (n.target.kind === 'consume' || n.target.kind === 'supply' ? 'supply' : 'target') : 'demand');
   const info = {
     target: ['TARGET', 'Fixed target – drives everything linked to it'],
     demand: ['◀ DEMAND', 'Sized by what its linked consumers pull (primary links)'],
-    supply: ['▶ SUPPLY', 'Runs on whatever reaches its linked inputs; output lands on top of demand'],
+    supply: ['▶ SUPPLY', 'Uses everything that reaches its linked inputs (primary links); it is still pulled through when it sits between a demand and its supplier'],
+    'sink-target': ['TARGET', 'Desired rate into this sink – drives everything linked to it'],
     'supply-auto': ['▶ SUPPLY (auto)', 'Only feeds secondary links, so nothing pulls it: it runs on what its inputs provide and adds on top'],
   }[mode] || [mode.toUpperCase(), ''];
   return el('span', { class: 'mode ' + mode, 'data-tip': info[1] }, info[0]);
@@ -917,7 +983,13 @@ function loadState(j, name = '') {
   R = null; selNode = null; selLink = null;
   applyView(); changed();
 }
-function persist() { localStorage.setItem('pp.current', JSON.stringify({ ...serial(), name: S.name })); }
+function persist() { localStorage.setItem('pp.current', JSON.stringify({ ...serial(), name: S.name })); autosaveSoon(); }
+// server-side copy of the current canvas (layouts/_autosave.json) so it survives browser resets and can be inspected
+let ast = null;
+function autosaveSoon() {
+  clearTimeout(ast);
+  ast = setTimeout(() => { fetch('api/layouts/_autosave', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...serial(), name: S.name }, null, 1) }).catch(() => {}); }, 2000);
+}
 let pt = null; function persistSoon() { clearTimeout(pt); pt = setTimeout(persist, 300); }
 async function saveLayout() {
   const name = prompt('Save layout as:', S.name || 'my-factory');
@@ -965,6 +1037,6 @@ async function init() {
   const saved = localStorage.getItem('pp.current');
   if (saved) { try { const j = JSON.parse(saved); loadState(j, j.name || ''); } catch { applyView(); } } else applyView();
   status(`${Object.keys(D.machines).length} machines · ${Object.keys(D.recipes).length} recipes · ${Object.keys(D.items).length} items/fluids`);
-  if (S.nodes.length) solve();
+  if (S.nodes.length) { solve(); autosaveSoon(); }
 }
 init();

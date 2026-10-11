@@ -42,3 +42,15 @@ Base numbers stay exactly the demand-driven ones; toggle off = no change at all.
 - A capped input is marked ⛔ (bottleneck); over-supply that still can't be used is shown as "(x idle)".
 - Chance outputs: link the base yield as primary and the chance-based producer as secondary; the expected extra
   shows up as potential.
+
+### Supply nodes, sinks with a rate, setup hints (update)
+
+- Supply-mode nodes no longer cut a chain: in the demand pass they run on what reaches them over primary
+  links and can be pulled through (e.g. a supply-mode screener fed by an infinite source now delivers what the
+  furnace downstream needs). Linked byproducts going into supply nodes are used before anything is wasted, and
+  the solver prefers fewer raw resources (infinite-source draw + imports) over fewer machines, so a linked
+  recycle reduces upstream demand.
+- Infinite sink: "take everything" (default) or "want rate" – the sink then pulls that rate like a target.
+- Yellow hints on nodes explain common setup problems, with a one-click fix: supply node with nothing linked
+  into it, several targets in one chain, an input short because it is only fed by secondary links.
+- The current canvas is also autosaved server-side to `layouts/_autosave.json` (2 s after a change and on load).

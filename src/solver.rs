@@ -389,6 +389,10 @@ pub fn solve(ds: &Dataset, req_in: &SolveReq) -> SolveResp {
         .zip(models.iter())
         .map(|(n, m)| {
             if let Some(sp) = &m.special {
+                // an infinite sink with a desired rate pulls like a target; without one it takes everything
+                if sp == "sink" && n.target.as_ref().map_or(false, |t| t.kind == "rate" && t.value > 0.0) {
+                    return "sink-target".into();
+                }
                 return sp.clone();
             }
             if explicit_target(n) {
@@ -407,8 +411,9 @@ pub fn solve(ds: &Dataset, req_in: &SolveReq) -> SolveResp {
     let supply: Vec<bool> = modes.iter().map(|m| m == "sink" || m == "supply" || m == "supply-auto").collect();
     let has_target = req.nodes.iter().any(|n| n.target.as_ref().map(|t| t.kind == "machines" || t.kind == "rate").unwrap_or(false));
 
-    let ctx = Ctx { req, models: &models, links: &valid_links, supply: &supply };
-    // Phase A (demand): supply-mode nodes are off; everything else is sized by targets + downstream demand.
+    let ctx = Ctx { req, models: &models, links: &valid_links, supply: &supply, cap: std::cell::Cell::new(f64::INFINITY) };
+    // Phase A (demand): everything is sized by targets + downstream demand; supply-mode nodes run on what
+    // reaches them over primary links (and may be pulled through from demand-sized upstream / sources).
     let ph1 = match ctx.phase_a(&mut msgs) {
         Ok(v) => v,
         Err(e) => return fail(e),
@@ -566,6 +571,7 @@ struct LpSol {
 // ---------------- lexicographic LP engine ----------------
 #[derive(Clone)]
 struct Lp {
+    failed: usize, // tie-break stages lexi had to give up on
     nvars: usize,
     bounds: Vec<(f64, f64)>,
     cons: Vec<(Vec<(usize, f64)>, ComparisonOp, f64)>,
@@ -592,19 +598,42 @@ impl Lp {
     }
     /// Minimise each objective in turn, keeping earlier optima (within tolerance).
     fn lexi(&mut self, stages: &[Vec<(usize, f64)>]) -> Result<Vec<f64>, String> {
-        let mut last = None;
+        let mut last: Option<Vec<f64>> = None;
+        // (objective, optimum) of every stage fixed so far, so their tolerances can be relaxed on trouble
+        let mut fixed: Vec<(Vec<(usize, f64)>, f64)> = Vec::new();
+        let base = self.cons.len();
         for (k, obj) in stages.iter().enumerate() {
             if obj.is_empty() {
                 continue;
             }
-            let v = match self.solve(obj) {
-                Ok(v) => v,
-                Err(e) if k == 0 || last.is_none() => return Err(e),
-                Err(_) => break, // numerical trouble in a tie-break stage: keep previous optimum
+            let mut got = None;
+            // microlp occasionally reports a numerically tight problem as infeasible: relax the earlier
+            // optima a little and retry before giving up on this tie-break stage
+            for rel in [1e-9, 1e-7, 1e-5] {
+                self.cons.truncate(base);
+                for (o, val) in &fixed {
+                    let tol = if val.abs() < 1e-9 && rel <= 1e-9 { 0.0 } else { rel * val.abs().max(1.0) };
+                    self.cons.push((o.clone(), ComparisonOp::Le, *val + tol));
+                }
+                match self.solve(obj) {
+                    Ok(v) => {
+                        got = Some(v);
+                        break;
+                    }
+                    Err(e) if k == 0 || last.is_none() => return Err(e),
+                    Err(e) => {
+                        if std::env::var("PP_DEBUG").is_ok() {
+                            eprintln!("lexi stage {k} failed at rel {rel}: {e}");
+                        }
+                    }
+                }
+            }
+            let Some(v) = got else {
+                self.failed += 1;
+                break;
             };
             let val: f64 = obj.iter().map(|(i, w)| v[*i] * w).sum();
-            let tol = if val.abs() < 1e-9 { 0.0 } else { 1e-9 * val.abs().max(1.0) };
-            self.cons.push((obj.clone(), ComparisonOp::Le, val.max(0.0_f64.min(val)) + tol));
+            fixed.push((obj.clone(), val));
             last = Some(v);
         }
         match last {
@@ -619,6 +648,7 @@ struct Ctx<'a> {
     models: &'a [NodeModel],
     links: &'a [&'a LinkReq],
     supply: &'a [bool],
+    cap: std::cell::Cell<f64>, // upper bound on supply-node machine counts in the supply pass
 }
 struct Built {
     lp: Lp,
@@ -635,7 +665,7 @@ impl<'a> Ctx<'a> {
     /// `prev` = phase-A solution when building phase B: non-supply node sizes and primary flows into
     /// non-supply nodes are frozen, so secondary supply can only add on top.
     fn build(&self, prev: Option<&LpSol>, msgs: &mut Vec<String>) -> Built {
-        let mut lp = Lp { nvars: 0, bounds: vec![], cons: vec![] };
+        let mut lp = Lp { failed: 0, nvars: 0, bounds: vec![], cons: vec![] };
         let n = self.req.nodes.len();
         let idx: HashMap<&str, usize> = self.req.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
         let xs: Vec<usize> = (0..n).map(|_| lp.var(0.0, f64::INFINITY)).collect();
@@ -650,7 +680,8 @@ impl<'a> Ctx<'a> {
                     None if prio(l) >= 2 => lp.var(0.0, 0.0),
                     Some(p) if prio(l) == 1 && !to_supply => {
                         let v = p.f[li].max(0.0);
-                        lp.var(v, v)
+                        let e = 1e-9 * v.max(1.0);
+                        lp.var((v - e).max(0.0), v + e)
                     }
                     _ => lp.var(0.0, f64::INFINITY),
                 }
@@ -695,22 +726,25 @@ impl<'a> Ctx<'a> {
             let m = &self.models[ni];
             if self.supply[ni] {
                 let has_linked_in = m.ins.iter().any(|(it, _)| self.links.iter().any(|l| l.to.node == node.id && &l.to.item == it));
-                if prev.is_none() || !has_linked_in {
+                // demand pass: supply nodes already run on what reaches them over primary links (the
+                // "waste" stage below makes them eat it), so their output can cut what others must make
+                if !has_linked_in {
                     if prev.is_some() && m.special.is_none() {
                         msgs.push(format!("supply-mode node {} has no linked input", node.id));
                     }
                     lp.cons.push((vec![(xs[ni], 1.0)], ComparisonOp::Eq, 0.0));
-                } else {
-                    lp.bounds[xs[ni]].1 = 1e7; // safety against loops with gain > 1
+                } else if prev.is_some() {
+                    lp.bounds[xs[ni]].1 = self.cap.get(); // safety against loops with gain > 1
                 }
                 continue;
             }
             if let Some(p) = prev {
                 let v = p.x[ni].max(0.0);
-                lp.bounds[xs[ni]] = (v, v);
+                let e = 1e-9 * v.max(1.0); // frozen, with a hair of slack so microlp stays feasible
+                lp.bounds[xs[ni]] = ((v - e).max(0.0), v + e);
                 continue;
             }
-            if m.special.is_some() {
+            if m.special.as_deref() == Some("source") || (m.special.is_some() && node.target.as_ref().map_or(true, |t| t.kind != "rate")) {
                 continue;
             }
             let Some(t) = &node.target else { continue };
@@ -720,7 +754,7 @@ impl<'a> Ctx<'a> {
             match t.kind.as_str() {
                 "machines" => lp.cons.push((vec![(xs[ni], 1.0)], ComparisonOp::Eq, t.value)),
                 "rate" => {
-                    let item = t.item.clone().or_else(|| m.outs.first().map(|x| x.0.clone()));
+                    let item = t.item.clone().or_else(|| m.outs.first().or(m.ins.first()).map(|x| x.0.clone()));
                     let Some(item) = item else { continue };
                     let per = m.outs.iter().chain(m.ins.iter()).find(|(n, _)| *n == item).map(|x| x.1);
                     match per {
@@ -773,7 +807,38 @@ impl<'a> Ctx<'a> {
                 size.push((*v, 1e-3));
             }
         }
-        let stages = vec![self.deficits(&b), size];
+        // "use what you linked": output that has a primary link should be consumed, not wasted, before
+        // minimising machine count (lets byproduct recycles / supply-mode recyclers reduce upstream demand)
+        let waste: Vec<(usize, f64)> = b
+            .slack
+            .iter()
+            .filter(|((ni, d, item), _)| {
+                !*d && self.links.iter().any(|l| {
+                    prio(l) == 1
+                        && l.from.node == self.req.nodes[*ni].id
+                        && &l.from.item == item
+                        && self.req.nodes.iter().position(|x| x.id == l.to.node).map_or(false, |t| self.supply[t])
+                })
+            })
+            .map(|(_, v)| (*v, 1.0))
+            .collect();
+        // then fewest raw resources: infinite-source draw + unlinked (imported) inputs, so a linked recycle
+        // of a byproduct is preferred over making more from scratch; machine count only breaks ties
+        let mut raw: Vec<(usize, f64)> = Vec::new();
+        for (i, m) in self.models.iter().enumerate() {
+            let nid = &self.req.nodes[i].id;
+            match m.special.as_deref() {
+                Some("source") => raw.push((b.xs[i], 1.0)),
+                Some(_) => {}
+                None => {
+                    let w: f64 = m.ins.iter().filter(|(it, _)| !self.links.iter().any(|l| &l.to.node == nid && &l.to.item == it)).map(|(_, p)| *p).sum();
+                    if w > 0.0 {
+                        raw.push((b.xs[i], w));
+                    }
+                }
+            }
+        }
+        let stages = vec![self.deficits(&b), waste, raw, size];
         let v = b.lp.lexi(&stages).map_err(|e| format!("solver failed: {e} (conflicting targets?)"))?;
         Ok(self.finish(&b, v))
     }
@@ -781,7 +846,7 @@ impl<'a> Ctx<'a> {
     /// inputs (primary links first), then secondary/tertiary links push leftovers on top of demand:
     /// first into any remaining shortfall, the rest shows up as excess (over-production).
     fn phase_b(&self, a: &LpSol, msgs: &mut Vec<String>) -> Result<LpSol, String> {
-        let mut b = self.build(Some(a), msgs);
+        let b = self.build(Some(a), msgs);
         let mut stages = vec![self.deficits(&b)];
         for k in 1..=MAXP {
             stages.push(self.prio_flows(&b, k, -1.0, true));
@@ -790,8 +855,28 @@ impl<'a> Ctx<'a> {
         for k in 2..=MAXP {
             stages.push(self.prio_flows(&b, k, -1.0, false));
         }
-        let v = b.lp.lexi(&stages).map_err(|e| format!("solver failed in supply pass: {e}"))?;
-        Ok(self.finish(&b, v))
+        // microlp is touchy: unbounded supply nodes first (a gain loop just stops that stage), finite caps
+        // only if a stage fails numerically; keep the attempt with the fewest abandoned stages
+        let mut best: Option<(usize, LpSol)> = None;
+        let mut err = String::new();
+        for cap in [f64::INFINITY, 1e7, 1e4] {
+            self.cap.set(cap);
+            let mut b = self.build(Some(a), &mut Vec::new());
+            match b.lp.lexi(&stages) {
+                Ok(v) => {
+                    let f = b.lp.failed;
+                    if best.as_ref().map_or(true, |(bf, _)| f < *bf) {
+                        best = Some((f, self.finish(&b, v)));
+                    }
+                    if f == 0 {
+                        break;
+                    }
+                }
+                Err(e) => err = e,
+            }
+        }
+        self.cap.set(f64::INFINITY);
+        best.map(|x| x.1).ok_or_else(|| format!("solver failed in supply pass: {err}"))
     }
 }
 
@@ -833,7 +918,7 @@ impl<'a> Ctx<'a> {
                 })
         };
         let build = |allow_helpers: bool| {
-        let mut lp = Lp { nvars: 0, bounds: vec![], cons: vec![] };
+        let mut lp = Lp { failed: 0, nvars: 0, bounds: vec![], cons: vec![] };
         let ys: Vec<usize> = (0..n)
             .map(|ni| {
                 let m = &self.models[ni];

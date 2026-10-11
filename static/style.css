@@ -162,3 +162,10 @@ input[type=number]{width:70px}
 .potsec { border-left: 3px solid #8f5cff; padding-left: 8px; }
 .potsec h4 { color: #b78cff; }
 .pot-chk { color: #b78cff; }
+
+.errmsg.hint { font-size: 11px; line-height: 1.35; max-width: 320px; }
+.fixbtn { margin-left: 4px; font-size: 11px; padding: 1px 6px; border-radius: 4px; border: 1px solid #c9a227; background: #3a3214; color: #f3d77a; cursor: pointer; }
+.fixbtn:hover { background: #4d4219; }
+.node.special .node-f { display: flex; gap: 6px; align-items: center; }
+.node.special .tval { width: 70px; }
+.mode.sink-target { background: #8a5a12; color: #ffe2a8; }
