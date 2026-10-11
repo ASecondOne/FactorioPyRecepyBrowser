@@ -868,6 +868,12 @@ function renderSummary() {
   sec('Short on linked inputs', R.deficits, true);
   sec('Over-production (secondary on top of demand)', R.excess);
   const P = R.potential;
+  if (P && !(P.machines > 1e-9 || Object.keys(P.outputs || {}).length)) {
+    const anySec = S.links.some((l) => (l.priority || 1) > 1);
+    s.append(el('div', { class: 'potsec' }, el('h4', {}, 'Potential'), el('div', { class: 'pot dim' }, anySec
+      ? 'No over-supply arriving via secondary/tertiary links right now — nothing extra to run.'
+      : 'No secondary over-supply in this layout — mark a link as S (click its P badge) to see potential.')));
+  }
   if (P && (P.machines > 1e-9 || Object.keys(P.outputs || {}).length)) {
     const ent = (o) => Object.entries(o || {}).filter(([, v]) => v > 1e-9).sort((a, b) => b[1] - a[1]);
     const box = el('div', { class: 'potsec' }, el('h4', {}, 'Potential extra output (using over-supply)'),

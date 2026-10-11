@@ -93,6 +93,16 @@ async fn delete_layout(State(st): State<Arc<AppState>>, Path(name): Path<String>
     }
 }
 
+/// Icons rarely change: cache them a day. Everything else (index.html, app.js, style.css, api) must be
+/// revalidated so a rebuilt/updated planner is picked up on a normal reload.
+async fn cache_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let icons = req.uri().path().starts_with("/icons/");
+    let mut res = next.run(req).await;
+    let v = if icons { "public, max-age=86400" } else { "no-cache" };
+    res.headers_mut().entry(header::CACHE_CONTROL).or_insert(header::HeaderValue::from_static(v));
+    res
+}
+
 #[tokio::main]
 async fn main() {
     let root = find_root();
@@ -109,6 +119,7 @@ async fn main() {
         .route("/api/layouts/:name", get(get_layout).put(put_layout).delete(delete_layout))
         .with_state(state)
         .fallback_service(ServeDir::new(root.join("static")))
+        .layer(axum::middleware::from_fn(cache_headers))
         .layer(CompressionLayer::new());
 
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8642);
