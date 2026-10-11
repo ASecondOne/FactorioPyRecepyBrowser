@@ -27,3 +27,18 @@ Run: `./run.sh --open` → http://localhost:8642 (set `PORT=...` to change).
 After mod updates: `tools/refresh-data.sh` (re-dumps from Factorio, rebuilds `data/` and `static/icons/`).
 
 API: `GET /api/data`, `POST /api/solve`, `GET/PUT/DELETE /api/layouts/<name>`.
+
+### Potential (over-supply) layer
+
+Toggle **potential** in the toolbar (remembered). When on, a second, additive solve shows in purple what the
+over-supply arriving via secondary/tertiary links could additionally run: extra machines in the node header
+(`× 0.333 +0.0241`), `+x` next to port rates and link badges, and a *Potential extra output* section in the summary.
+Base numbers stay exactly the demand-driven ones; toggle off = no change at all.
+
+- Extra on a node is capped by its linked inputs: only over-supply, or extra coming from an upstream node that
+  itself runs on over-supply, counts. Unlinked inputs are imports and assumed unlimited.
+- Plain upstream nodes that only depend on imports may scale up as helpers to feed a driven node's other inputs
+  (shown purple too). If that would make a loop unbounded, helpers are ignored (noted in the summary).
+- A capped input is marked ⛔ (bottleneck); over-supply that still can't be used is shown as "(x idle)".
+- Chance outputs: link the base yield as primary and the chance-based producer as secondary; the expected extra
+  shows up as potential.

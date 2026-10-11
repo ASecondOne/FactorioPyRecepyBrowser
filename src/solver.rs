@@ -139,6 +139,9 @@ pub struct LinkReq {
 pub struct SolveReq {
     pub nodes: Vec<NodeReq>,
     pub links: Vec<LinkReq>,
+    /// also compute the "potential" layer: what the over-supply from secondary links could additionally run
+    #[serde(default)]
+    pub potential: bool,
 }
 
 // ---------- response ----------
@@ -189,6 +192,26 @@ pub struct SolveResp {
     pub sinks: BTreeMap<String, f64>,
     pub fuel_power_w: f64,
     pub excess: BTreeMap<String, f64>,
+    pub potential: Option<Potential>,
+}
+
+#[derive(Serialize, Default)]
+pub struct PotNode {
+    pub extra_machines: f64,
+    pub inputs: BTreeMap<String, f64>,  // extra consumption per input item
+    pub outputs: BTreeMap<String, f64>, // extra production per output item
+    pub unused_supply: BTreeMap<String, f64>, // over-supply on an input that still can't be used
+    pub limit: Vec<String>, // input items that cap the extra (bottleneck)
+    pub helper: bool,       // not fed by over-supply itself; runs extra only to supply a driven node
+}
+#[derive(Serialize, Default)]
+pub struct Potential {
+    pub nodes: BTreeMap<String, PotNode>,
+    pub links: BTreeMap<String, f64>,
+    pub outputs: BTreeMap<String, f64>, // extra output that leaves the graph (unlinked outputs + not-consumed extra)
+    pub inputs: BTreeMap<String, f64>,  // extra imports on unlinked inputs
+    pub machines: f64,
+    pub note: String,
 }
 
 struct NodeModel {
@@ -491,6 +514,7 @@ pub fn solve(ds: &Dataset, req_in: &SolveReq) -> SolveResp {
         nodes_out.push(no);
     }
     // net: an item that is both imported and exported externally -> keep both but it's informative
+    let mut msgs_pot: Vec<String> = Vec::new();
     let links_out = valid_links.iter().zip(sol.f.iter()).map(|(l, v)| LinkOut { id: l.id.clone(), rate: clean(*v) }).collect();
     if !deficits.is_empty() {
         msgs.push("some linked inputs could not be fully supplied (see deficits)".into());
@@ -509,6 +533,7 @@ pub fn solve(ds: &Dataset, req_in: &SolveReq) -> SolveResp {
         sinks,
         fuel_power_w: fuel_power,
         excess,
+        potential: if req.potential { Some(ctx.potential(&sol, &mut msgs_pot)) } else { None },
     }
 }
 
@@ -527,6 +552,7 @@ fn fail(e: String) -> SolveResp {
         sinks: BTreeMap::new(),
         fuel_power_w: 0.0,
         excess: BTreeMap::new(),
+        potential: None,
     }
 }
 
@@ -766,5 +792,192 @@ impl<'a> Ctx<'a> {
         }
         let v = b.lp.lexi(&stages).map_err(|e| format!("solver failed in supply pass: {e}"))?;
         Ok(self.finish(&b, v))
+    }
+}
+
+impl<'a> Ctx<'a> {
+    /// Potential layer (additive, base untouched): the over-supply that secondary/tertiary links deliver on
+    /// top of demand could run the receiving node harder. Extra machines y_n are limited by every LINKED input
+    /// (only over-supply or extra flowing in from upstream potential counts); unlinked inputs are imports and
+    /// assumed unlimited. Extra output then flows on through links to consumers, which may run extra too.
+    fn potential(&self, base: &LpSol, _msgs: &mut Vec<String>) -> Potential {
+        let n = self.req.nodes.len();
+        let linked_in = |ni: usize, item: &str| self.links.iter().any(|l| l.to.node == self.req.nodes[ni].id && l.to.item == item);
+        let idx: HashMap<&str, usize> = self.req.nodes.iter().enumerate().map(|(i, nd)| (nd.id.as_str(), i)).collect();
+        let over = |ni: usize, item: &str| base.over.get(&(ni, item.to_string())).copied().unwrap_or(0.0).max(0.0);
+        // "driven" nodes: receive over-supply, or (transitively) extra output from a driven node
+        let mut driven = vec![false; n];
+        for (ni, m) in self.models.iter().enumerate() {
+            driven[ni] = m.ins.iter().any(|(it, _)| over(ni, it) > 1e-9);
+        }
+        loop {
+            let mut ch = false;
+            for l in self.links.iter() {
+                if let (Some(&a), Some(&b)) = (idx.get(l.from.node.as_str()), idx.get(l.to.node.as_str())) {
+                    if driven[a] && !driven[b] && self.models[b].err.is_none() {
+                        driven[b] = true;
+                        ch = true;
+                    }
+                }
+            }
+            if !ch {
+                break;
+            }
+        }
+        // a driving port carries the extra (over-supply or links from driven nodes); helpers (non-driven
+        // upstream nodes, which can scale on their own imports) may only top up the other inputs
+        let driving = |ni: usize, item: &str| {
+            over(ni, item) > 1e-9
+                || self.links.iter().any(|l| {
+                    l.to.node == self.req.nodes[ni].id && l.to.item == item && idx.get(l.from.node.as_str()).map_or(false, |&a| driven[a])
+                })
+        };
+        let build = |allow_helpers: bool| {
+        let mut lp = Lp { nvars: 0, bounds: vec![], cons: vec![] };
+        let ys: Vec<usize> = (0..n)
+            .map(|ni| {
+                let m = &self.models[ni];
+                let ok = m.err.is_none() && m.special.as_deref() != Some("source");
+                lp.var(0.0, if ok { f64::INFINITY } else { 0.0 })
+            })
+            .collect();
+        let gs: Vec<usize> = self
+            .links
+            .iter()
+            .map(|l| {
+                let blocked = match (idx.get(l.from.node.as_str()), idx.get(l.to.node.as_str())) {
+                    (Some(&a), Some(&b)) => !driven[a] && (driving(b, &l.to.item) || (!allow_helpers && driven[b])),
+                    _ => true,
+                };
+                lp.var(0.0, if blocked { 0.0 } else { f64::INFINITY })
+            })
+            .collect();
+        let mut in_rows: Vec<(usize, String, f64, Vec<usize>)> = Vec::new();
+        for (ni, m) in self.models.iter().enumerate() {
+            let nid = &self.req.nodes[ni].id;
+            for (item, per) in &m.ins {
+                if !linked_in(ni, item) {
+                    continue;
+                }
+                let gl: Vec<usize> = self.links.iter().zip(gs.iter()).filter(|(l, _)| &l.to.node == nid && &l.to.item == item).map(|x| *x.1).collect();
+                // per*y <= over + sum(g_in)
+                let mut e: Vec<(usize, f64)> = gl.iter().map(|g| (*g, -1.0)).collect();
+                e.push((ys[ni], *per));
+                let o = over(ni, item);
+                lp.cons.push((e, ComparisonOp::Le, o));
+                in_rows.push((ni, item.clone(), o, gl));
+            }
+            for (item, per) in &m.outs {
+                let gl: Vec<usize> = self.links.iter().zip(gs.iter()).filter(|(l, _)| &l.from.node == nid && &l.from.item == item).map(|x| *x.1).collect();
+                // infinite sources can hand out any extra; everything else only what its extra machines make
+                if gl.is_empty() || m.special.as_deref() == Some("source") {
+                    continue;
+                }
+                let mut e: Vec<(usize, f64)> = gl.iter().map(|g| (*g, 1.0)).collect();
+                e.push((ys[ni], -per));
+                lp.cons.push((e, ComparisonOp::Le, 0.0));
+            }
+        }
+        let stages = vec![
+            (0..n).filter(|i| driven[*i]).map(|i| (ys[i], -1.0)).collect::<Vec<_>>(),
+            (0..n).filter(|i| !driven[*i]).map(|i| (ys[i], 1.0)).collect::<Vec<_>>(),
+            gs.iter().map(|g| (*g, 1.0)).collect::<Vec<_>>(),
+        ];
+        (lp, ys, gs, in_rows, stages)
+        };
+        if !driven.iter().any(|d| *d) {
+            return Potential::default();
+        }
+        // 1) helpers may scale up to feed driven nodes' other inputs; 2) if that is unbounded (a loop that
+        // can feed itself from imports) only over-supply/driven extra may feed driven nodes; 3) microlp is
+        // touchy with big finite bounds, so caps on machine counts are the last resort
+        let mut chosen = build(true);
+        let mut res = chosen.0.clone().lexi(&chosen.4);
+        if res.is_err() {
+            chosen = build(false);
+            res = chosen.0.clone().lexi(&chosen.4);
+            if res.is_ok() {
+                _msgs.push("potential: a loop could run unbounded on imports; helpers ignored".into());
+            }
+        }
+        for cap in [1e4, 1e2] {
+            if res.is_ok() {
+                break;
+            }
+            let mut l2 = chosen.0.clone();
+            for y in &chosen.1 {
+                if l2.bounds[*y].1 > 0.0 {
+                    l2.bounds[*y].1 = cap;
+                }
+            }
+            res = l2.lexi(&chosen.4);
+        }
+        let (_, ys, gs, in_rows, _) = chosen;
+        let v = match res {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("potential LP failed: {e}");
+                return Potential::default();
+            }
+        };
+        let cl = |x: f64| if x.abs() < 1e-7 { 0.0 } else { x };
+        let mut pot = Potential { note: _msgs.join("; "), ..Default::default() };
+        for (li, l) in self.links.iter().enumerate() {
+            let g = cl(v[gs[li]]);
+            if g > 0.0 {
+                pot.links.insert(l.id.clone(), g);
+            }
+        }
+        for (ni, m) in self.models.iter().enumerate() {
+            let y = cl(v[ys[ni]]);
+            let nid = &self.req.nodes[ni].id;
+            let mut pn = PotNode { extra_machines: y, helper: !driven[ni], ..Default::default() };
+            let mut got_extra = false;
+            for (ri, item, o, gl) in in_rows.iter().filter(|r| r.0 == ni).map(|r| (r.0, &r.1, r.2, &r.3)) {
+                let _ = ri;
+                let per = m.ins.iter().find(|(i, _)| i == item).map(|x| x.1).unwrap_or(0.0);
+                let avail = o + gl.iter().map(|g| v[*g]).sum::<f64>();
+                if avail > 1e-7 {
+                    got_extra = true;
+                }
+                let left = cl(avail - per * y);
+                if left > 1e-6 * avail.max(1.0) {
+                    pn.unused_supply.insert(item.clone(), left);
+                } else {
+                    pn.limit.push(item.clone()); // tight: this input caps the extra
+                }
+            }
+            if !got_extra && y == 0.0 {
+                continue;
+            }
+            if pn.unused_supply.is_empty() {
+                pn.limit.clear(); // everything that arrived got used: nothing is "limiting"
+            }
+            for (item, per) in &m.ins {
+                if per * y > 1e-9 {
+                    pn.inputs.insert(item.clone(), per * y);
+                    if !linked_in(ni, item) {
+                        *pot.inputs.entry(item.clone()).or_insert(0.0) += per * y;
+                    }
+                }
+            }
+            for (item, per) in &m.outs {
+                let ex = per * y;
+                if ex <= 1e-9 {
+                    continue;
+                }
+                pn.outputs.insert(item.clone(), ex);
+                let sent: f64 = self.links.iter().zip(gs.iter()).filter(|(l, _)| &l.from.node == nid && &l.from.item == item).map(|(_, g)| v[*g]).sum();
+                let rest = cl(ex - sent);
+                if rest > 1e-6 * ex.max(1.0) && m.special.is_none() {
+                    *pot.outputs.entry(item.clone()).or_insert(0.0) += rest;
+                }
+            }
+            if m.special.is_none() {
+                pot.machines += y;
+            }
+            pot.nodes.insert(nid.clone(), pn);
+        }
+        pot
     }
 }

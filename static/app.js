@@ -291,7 +291,7 @@ function renderNode(n) {
     icon(m.icon),
     el('div', { class: 'title' },
       el('div', { class: 'mname', 'data-tip': 'Click to switch machine (tier)', onclick: (e) => { e.stopPropagation(); openMachineSwitch(n); } }, m.n),
-      el('div', { class: 'count' }, cnt === null ? '' : '× ' + fmt(cnt), cnt ? el('small', {}, `  (${Math.ceil(cnt - 1e-6)} buildings)`) : '', modeBadge(n, res))),
+      el('div', { class: 'count' }, cnt === null ? '' : '× ' + fmt(cnt), potHead(n), cnt ? el('small', {}, `  (${Math.ceil(cnt - 1e-6)} buildings)`) : '', modeBadge(n, res))),
     el('button', { class: 'x', 'data-tip': 'Delete node', onclick: (e) => { e.stopPropagation(); deleteNode(n); } }, '✕'));
   head.addEventListener('mousedown', (e) => startNodeDrag(e, n));
   box.append(head);
@@ -373,6 +373,26 @@ function modeBadge(n, res) {
   return el('span', { class: 'mode ' + mode, 'data-tip': info[1] }, info[0]);
 }
 function fmtJ(j) { return j >= 1e6 ? +(j / 1e6).toFixed(2) + ' MJ' : +(j / 1e3).toFixed(1) + ' kJ'; }
+// ---- potential layer (purple): what over-supply from secondary links could additionally run ----
+function potOf(n) { return R?.potential?.nodes?.[n.id] || null; }
+function potHead(n) {
+  const P = potOf(n);
+  if (!P || !(P.extra_machines > 1e-9)) return '';
+  const tip = P.helper ? 'Potential: extra machines needed upstream to feed a node running on over-supply' : 'Potential: extra machines the over-supply from secondary links could run'
+    + (P.limit?.length ? `\nlimited by: ${P.limit.map(itemName).join(', ')}` : '');
+  return el('span', { class: 'pot', 'data-tip': tip }, ' +' + fmt(P.extra_machines));
+}
+function potPort(n, item, dir) {
+  const P = potOf(n);
+  if (!P) return [];
+  const out = [];
+  const v = (dir === 'in' ? P.inputs : P.outputs)?.[item];
+  if (v > 1e-9) out.push(el('span', { class: 'pot', 'data-tip': `Potential extra ${dir === 'in' ? 'consumption' : 'output'}: ${fmt(v * unit())}${unitLabel()}` }, '+' + fmt(v * unit())));
+  if (dir === 'in' && P.limit?.includes(item)) out.push(el('span', { class: 'pot lim', 'data-tip': 'Bottleneck: this input caps the potential extra' }, '⛔'));
+  const u = dir === 'in' ? P.unused_supply?.[item] : 0;
+  if (u > 1e-7) out.push(el('span', { class: 'pot dim', 'data-tip': `${fmt(u * unit())}${unitLabel()} over-supply still unusable (other inputs are the bottleneck)` }, `(${fmt(u * unit())} idle)`));
+  return out;
+}
 function renderPort(n, item, dir, res, meta = {}) {
   const pr = res && (dir === 'in' ? res.inputs : res.outputs).find((p) => p.item === item);
   const linked = S.links.some((l) => (dir === 'in' ? l.to.node === n.id && l.to.item === item : l.from.node === n.id && l.from.item === item));
@@ -388,6 +408,7 @@ function renderPort(n, item, dir, res, meta = {}) {
   p.append(h, itemIcon(item), rate);
   if (pr?.slack > 1e-7) p.append(el('span', { class: 'bal ' + (dir === 'in' ? 'short' : 'over') }, (dir === 'in' ? '−' : '+') + fmt(pr.slack * unit())));
   if (pr?.excess > 1e-7) p.append(el('span', { class: 'bal over' }, '+' + fmt(pr.excess * unit())));
+  p.append(...potPort(n, item, dir));
   if (meta.fuel) p.append(el('span', { class: 'tag', 'data-tip': 'fuel' }, '🔥'));
   if (meta.burnt) p.append(el('span', { class: 'tag', 'data-tip': 'burnt result of fuel' }, 'burnt'));
   if (!linked && !n.kind) {
@@ -483,7 +504,8 @@ function renderLinks() {
     let lab = null;
     if (rate !== undefined && showLabels) {
       const mk = el('span', { class: 'prio p' + pr, 'data-tip': `${PRIO[pr][1]}\nclick to cycle P → S → T · right-click for menu`, onmousedown: (e) => e.stopPropagation(), onclick: (e) => { e.stopPropagation(); setPriority(l, pr % 3 + 1); } }, PRIO[pr][0]);
-      lab = el('div', { class: 'lnk-label p' + pr + (selLink === l ? ' sel' : ''), 'data-link': l.id, 'data-tip': `${itemName(l.from.item)}: ${fmt(rate * unit())}${unitLabel()} (${PRIO[pr][1].split(' –')[0]})` }, mk, itemIcon(l.from.item), fmt(rate * unit()) + unitLabel());
+      lab = el('div', { class: 'lnk-label p' + pr + (selLink === l ? ' sel' : ''), 'data-link': l.id, 'data-tip': `${itemName(l.from.item)}: ${fmt(rate * unit())}${unitLabel()} (${PRIO[pr][1].split(' –')[0]})` }, mk, itemIcon(l.from.item), fmt(rate * unit()) + unitLabel(),
+        R?.potential?.links?.[l.id] > 1e-9 ? el('span', { class: 'pot', 'data-tip': 'Potential extra flow from over-supply' }, '+' + fmt(R.potential.links[l.id] * unit())) : '');
       lab.addEventListener('contextmenu', (e) => { e.preventDefault(); openLinkMenu(l, e.clientX, e.clientY); });
       lab.style.borderColor = col;
       lab.addEventListener('mousedown', sel); lab.addEventListener('dblclick', del);
@@ -845,6 +867,15 @@ function renderSummary() {
   sec('Dumped into infinite sinks', R.sinks);
   sec('Short on linked inputs', R.deficits, true);
   sec('Over-production (secondary on top of demand)', R.excess);
+  const P = R.potential;
+  if (P && (P.machines > 1e-9 || Object.keys(P.outputs || {}).length)) {
+    const ent = (o) => Object.entries(o || {}).filter(([, v]) => v > 1e-9).sort((a, b) => b[1] - a[1]);
+    const box = el('div', { class: 'potsec' }, el('h4', {}, 'Potential extra output (using over-supply)'),
+      el('div', { class: 'chips' }, ...ent(P.outputs).map(([k, v]) => chip(k, v))));
+    if (ent(P.inputs).length) box.append(el('h4', {}, 'Extra imports for that'), el('div', { class: 'chips' }, ...ent(P.inputs).map(([k, v]) => chip(k, v))));
+    box.append(el('div', {}, `+${fmt(P.machines)} machines${P.note ? ' · ' + P.note : ''}`));
+    s.append(box);
+  }
   s.append(el('div', {}, el('h4', {}, 'Totals'), el('div', {}, `${fmt(R.total_machines)} machines · ${fmtW(R.total_power_w)} electric${R.fuel_power_w ? ' · ' + fmtW(R.fuel_power_w) + ' from fuel' : ''}`)));
 }
 
@@ -853,7 +884,7 @@ let solveTimer = null, solveSeq = 0;
 function solveSoon() { clearTimeout(solveTimer); solveTimer = setTimeout(solve, 120); }
 async function solve() {
   const seq = ++solveSeq;
-  const body = { nodes: S.nodes.map((n) => ({ id: n.id, kind: n.kind || 'machine', item: n.item || null, fuel: n.fuel || null, machine: n.machine || '', recipe: n.recipe, modules: n.modules, extra_speed: n.extra_speed || 0, extra_prod: n.extra_prod || 0, target: n.target })), links: S.links };
+  const body = { potential: !!$('#showPotential')?.checked, nodes: S.nodes.map((n) => ({ id: n.id, kind: n.kind || 'machine', item: n.item || null, fuel: n.fuel || null, machine: n.machine || '', recipe: n.recipe, modules: n.modules, extra_speed: n.extra_speed || 0, extra_prod: n.extra_prod || 0, target: n.target })), links: S.links };
   try {
     const res = await fetch('api/solve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const j = await res.json();
@@ -915,6 +946,8 @@ async function init() {
   $('#unit').onchange = () => { renderNodes(); renderSummary(); persist(); };
   $('#btnFit').onclick = fitView;
   $('#showLabels').checked = localStorage.getItem('pp.labels') !== '0';
+  $('#showPotential').checked = localStorage.getItem('pp.potential') === '1';
+  $('#showPotential').onchange = () => { localStorage.setItem('pp.potential', $('#showPotential').checked ? '1' : '0'); solve(); };
   $('#showLabels').onchange = () => { localStorage.setItem('pp.labels', $('#showLabels').checked ? '1' : '0'); renderLinks(); };
   $('#btnNew').onclick = () => { if (!S.nodes.length || confirm('Clear the canvas?')) loadState({ nodes: [], links: [], view: { x: 300, y: 80, z: 1 } }); };
   $('#btnSave').onclick = saveLayout;
